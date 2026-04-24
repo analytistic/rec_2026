@@ -20,13 +20,16 @@ def prepare_data(data):
         feat_info: {seq_feature_dict, item_feature_dict, user_feature_dict}
 
         item_feature_dict / user_feature_dict (by type):
-            int_value / int_array:
+            int_value:
                 type, range: [min, max], values: {value: {map, count, prob}},
                 count, prob, coverage, map_range
+            int_array:
+                type, range: [min, max], values: {value: {map, count, prob}},
+                count, prob, coverage, map_range, max_len
             float_array:
                 type, array_len (固定长度 or None), count, prob, coverage
             int_array_and_float_array:
-                type, array_len (固定长度 or -1→None), count, prob, coverage, map_range,
+                type, array_len (固定长度 or -1→None), count, prob, coverage, map_range, max_len,
                 values: {int_value: {map, count, prob, float_stats: {min, max, mean}}}
 
         seq_feature_dict:
@@ -68,7 +71,7 @@ def prepare_data(data):
         for f in record.get('item_feature') or []:
             fid = f['feature_id']
             if fid not in item_feature_dict:
-                item_feature_dict[fid] = {
+                entry = {
                     'type': f['feature_value_type'],
                     'range': [float('inf'), float('-inf')],
                     'values': {},
@@ -76,6 +79,9 @@ def prepare_data(data):
                     'users_with_feature': set(),
                     'map_range': 0,
                 }
+                if f['feature_value_type'] == 'int_array':
+                    entry['max_len'] = 0
+                item_feature_dict[fid] = entry
 
             ftype = f['feature_value_type']
             item_feature_dict[fid]['count'] += 1
@@ -87,6 +93,9 @@ def prepare_data(data):
                 values_to_add.append(int(f['int_value']))
             elif ftype == 'int_array' and f.get('int_array') is not None:
                 values_to_add.extend(f['int_array'])
+                arr_len = len(f['int_array'])
+                if arr_len > item_feature_dict[fid]['max_len']:
+                    item_feature_dict[fid]['max_len'] = arr_len
 
             for v in values_to_add:
                 if v < item_feature_dict[fid]['range'][0]: item_feature_dict[fid]['range'][0] = v
@@ -111,9 +120,12 @@ def prepare_data(data):
                     entry['range'] = [float('inf'), float('-inf')]
                     entry['values'] = {}
                     entry['map_range'] = 0
+                    if ftype == 'int_array':
+                        entry['max_len'] = 0
                 elif ftype in ('float_array', 'int_array_and_float_array'):
                     entry['array_len'] = None
                     entry['map_range'] = 0
+                    entry['max_len'] = 0
                 user_feature_dict[fid] = entry
 
             ftype = f['feature_value_type']
@@ -125,6 +137,9 @@ def prepare_data(data):
                 values_to_add.append(int(f['int_value']))
             elif ftype == 'int_array' and f.get('int_array') is not None:
                 values_to_add.extend(f['int_array'])
+                arr_len = len(f['int_array'])
+                if arr_len > user_feature_dict[fid]['max_len']:
+                    user_feature_dict[fid]['max_len'] = arr_len
             elif ftype == 'float_array' and f.get('float_array') is not None:
                 arr_len = len(f['float_array'])
                 if user_feature_dict[fid]['array_len'] is None:
@@ -135,6 +150,8 @@ def prepare_data(data):
                 ia = f.get('int_array') or []
                 fa = f.get('float_array') or []
                 arr_len = len(ia)
+                if arr_len > user_feature_dict[fid]['max_len']:
+                    user_feature_dict[fid]['max_len'] = arr_len
                 if user_feature_dict[fid]['array_len'] is None:
                     user_feature_dict[fid]['array_len'] = arr_len
                 elif user_feature_dict[fid]['array_len'] >= 0 and user_feature_dict[fid]['array_len'] != arr_len:
