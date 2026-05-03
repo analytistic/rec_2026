@@ -19,3 +19,9 @@ wheels/
 # data
 data/*.json
 data/*.parquet
+
+# env
+.env
+
+# output
+output/
