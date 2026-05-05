@@ -25,3 +25,9 @@ data/*.parquet
 
 # output
 output/
+
+# Build artifacts
+src.zip
+
+# baseline
+baseline/

@@ -76,12 +76,15 @@ def parse_args() -> argparse.Namespace:
                         help='Training device, e.g. cuda or cpu')
 
     # Dtype control.
-    parser.add_argument('--dense_dtype', type=str, default='float32',
+    parser.add_argument('--dense_dtype', type=str, default='bfloat16',
                         choices=['float32', 'bfloat16', 'float16'],
                         help='Dtype for dense parameters (Linear, LayerNorm, etc.)')
     parser.add_argument('--sparse_dtype', type=str, default='float32',
                         choices=['float32', 'bfloat16'],
                         help='Dtype for sparse parameters (Embedding tables)')
+    parser.add_argument('--use_amp', action='store_true', default=False,
+                        help='Enable bfloat16 autocast during forward pass '
+                             '(prevents attention softmax from running in low precision)')
 
     # Data pipeline.
     parser.add_argument('--num_workers', type=int, default=16,
@@ -96,6 +99,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
+    parser.add_argument('--log_step', type=int, default=100,
+                        help='Log training loss every N steps '
+                             '(0 = only log epoch average)')
+    parser.add_argument('--accumulation_steps', type=int, default=1,
+                        help='Number of micro-batches to accumulate gradients over. '
+                             'Effective batch = batch_size * accumulation_steps')
     parser.add_argument('--seq_max_lens', type=str,
                         default='seq_a:256,seq_b:256,seq_c:512,seq_d:512',
                         help='Per-domain sequence truncation, format: seq_d:256,seq_c:128')
@@ -120,9 +129,15 @@ def parse_args() -> argparse.Namespace:
                              '(only this variant consumes --seq_top_k / --seq_causal)')
     parser.add_argument('--hidden_mult', type=int, default=4,
                         help='FFN inner-dim multiplier relative to d_model')
-    parser.add_argument('--dropout_rate', type=float, default=0.01,
-                        help='Dropout rate for the backbone '
-                             '(seq id-embedding dropout is twice this value)')
+    parser.add_argument('--embed_dropout_rate', type=float, default=0.01,
+                        help='Dropout rate for input embeddings')
+    parser.add_argument('--seq_id_dropout_rate', type=float, default=0.02,
+                        help='Dropout rate for high-cardinality seq ID features')
+    parser.add_argument('--hidden_dropout_rate', type=float, default=0.01,
+                        help='Dropout rate for hidden layers (encoder/attn/classifier)')
+    parser.add_argument('--norm_type', type=str, default='layer',
+                        choices=['layer', 'rms'],
+                        help='Normalization type: layer = LayerNorm, rms = RMSNorm')
     parser.add_argument('--seq_top_k', type=int, default=50,
                         help='Number of most-recent tokens kept by LongerEncoder '
                              '(only effective when --seq_encoder_type=longer)')
@@ -303,7 +318,10 @@ def main() -> None:
         "num_heads": args.num_heads,
         "seq_encoder_type": args.seq_encoder_type,
         "hidden_mult": args.hidden_mult,
-        "dropout_rate": args.dropout_rate,
+        "embed_dropout_rate": args.embed_dropout_rate,
+        "seq_id_dropout_rate": args.seq_id_dropout_rate,
+        "hidden_dropout_rate": args.hidden_dropout_rate,
+        "norm_type": args.norm_type,
         "seq_top_k": args.seq_top_k,
         "seq_causal": args.seq_causal,
         "action_num": args.action_num,
@@ -369,6 +387,9 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
+        use_amp=args.use_amp,
+        log_step=args.log_step,
+        accumulation_steps=args.accumulation_steps,
     )
 
     trainer.train()
