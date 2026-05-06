@@ -35,6 +35,11 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_timestamps: dict  # {domain: tensor [B, L]}, per-event raw timestamps for Fourier
+    timestamp: torch.Tensor  # [B], row-level timestamp for NS tokens
+    hour: torch.Tensor  # [B], row-level hour of day (1..24)
+    dow: torch.Tensor  # [B], row-level day of week (1..7)
+    weekend: torch.Tensor  # [B], row-level weekend flag (1=workday, 2=weekend)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -113,8 +118,51 @@ def apply_rope_to_tensor(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HyFormer Basic Components
+# Fourier Time Encoding
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+class FourierTimeEncoding(nn.Module):
+    """Multi-frequency sinusoidal time encoding.
+
+    Maps absolute timestamps (seconds) to a hidden-dimensional representation
+    via log-spaced Fourier features and a learned linear projection.
+
+    Used as a continuous positional encoding for both seq and NS tokens.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_frequencies: int = 12,
+        min_period_seconds: float = 3600.0,
+        max_period_seconds: float = 40 * 86400.0,
+    ) -> None:
+        super().__init__()
+        periods = torch.logspace(
+            math.log10(min_period_seconds),
+            math.log10(max_period_seconds),
+            steps=num_frequencies,
+        )
+        self.register_buffer('periods', periods)
+        self.proj = nn.Linear(2 * num_frequencies, d_model, bias=False)
+
+    def forward(self, timestamps: torch.Tensor) -> torch.Tensor:
+        """Computes Fourier time encoding.
+
+        Args:
+            timestamps: (B, L) integer seconds, 0 = padding.
+
+        Returns:
+            (B, L, D) time encoding, zero at padding positions.
+        """
+        t = timestamps.to(torch.float32).unsqueeze(-1)  # (B, L, 1)
+        angle = t / self.periods * (2 * math.pi)        # (B, L, F)
+        feats = torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1)  # (B, L, 2F)
+        out = self.proj(feats)                           # (B, L, D)
+        # Zero out padding positions (timestamp == 0)
+        mask = (timestamps > 0).unsqueeze(-1).to(out.dtype)
+        return out * mask
 
 
 class SwiGLU(nn.Module):
@@ -1361,7 +1409,8 @@ class PCVRHyFormer(nn.Module):
 
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0))
+                       + num_item_ns + (1 if self.has_item_dense else 0)
+                       + 3)  # +3 for row-level hour, dow, weekend tokens
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1424,6 +1473,14 @@ class PCVRHyFormer(nn.Module):
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+
+        # ================== Fourier Time Encoding ==================
+        self.time_fourier = FourierTimeEncoding(d_model=d_model)
+
+        # ================== Discrete Row-level Time Embeddings ==================
+        self.row_hour_emb = nn.Embedding(24 + 1, d_model, padding_idx=0)
+        self.row_dow_emb = nn.Embedding(7 + 1, d_model, padding_idx=0)
+        self.row_weekend_emb = nn.Embedding(2 + 1, d_model, padding_idx=0)
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
@@ -1521,6 +1578,11 @@ class PCVRHyFormer(nn.Module):
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
 
+        # Row-level time features (always preserved, never reinitialized)
+        for emb in [self.row_hour_emb, self.row_dow_emb, self.row_weekend_emb]:
+            nn.init.xavier_normal_(emb.weight.data)
+            emb.weight.data[0, :] = 0
+
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
     ) -> "set[int]":
@@ -1574,9 +1636,10 @@ class PCVRHyFormer(nn.Module):
                 else:
                     skip_count += 1
 
-        # time_embedding is always preserved
+        # time_embedding and row-level time features are always preserved
         if self.num_time_buckets > 0:
             skip_count += 1
+        skip_count += 3  # row_hour_emb, row_dow_emb, row_weekend_emb
 
         logging.info(f"Re-initialized {reinit_count} high-cardinality Embeddings "
                      f"(vocab>{cardinality_threshold}), kept {skip_count}")
@@ -1726,6 +1789,11 @@ class PCVRHyFormer(nn.Module):
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats.to(self.dense_dtype))).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
 
+        # Row-level discrete time tokens (hour, dow, weekend)
+        ns_parts.append(self.row_hour_emb(inputs.hour).to(self.dense_dtype).unsqueeze(1))
+        ns_parts.append(self.row_dow_emb(inputs.dow).to(self.dense_dtype).unsqueeze(1))
+        ns_parts.append(self.row_weekend_emb(inputs.weekend).to(self.dense_dtype).unsqueeze(1))
+
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
         # 2. Embed each sequence domain (dynamic)
@@ -1744,7 +1812,13 @@ class PCVRHyFormer(nn.Module):
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
-        # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
+        # 4. Fourier time encoding on all tokens before attention blocks
+        for i, domain in enumerate(self.seq_domains):
+            seq_tokens_list[i] = seq_tokens_list[i] + self.time_fourier(inputs.seq_timestamps[domain])
+        ns_tokens = ns_tokens + self.time_fourier(inputs.timestamp.unsqueeze(-1))
+        q_tokens_list = [q + self.time_fourier(inputs.timestamp.unsqueeze(-1)) for q in q_tokens_list]
+
+        # 5. Dropout + MultiSeqHyFormerBlock stack + output projection
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=self.training
@@ -1769,6 +1843,11 @@ class PCVRHyFormer(nn.Module):
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats.to(self.dense_dtype))).unsqueeze(1)
             ns_parts.append(item_dense_tok)
 
+        # Row-level discrete time tokens (hour, dow, weekend)
+        ns_parts.append(self.row_hour_emb(inputs.hour).to(self.dense_dtype).unsqueeze(1))
+        ns_parts.append(self.row_dow_emb(inputs.dow).to(self.dense_dtype).unsqueeze(1))
+        ns_parts.append(self.row_weekend_emb(inputs.weekend).to(self.dense_dtype).unsqueeze(1))
+
         ns_tokens = torch.cat(ns_parts, dim=1)
 
         seq_tokens_list = []
@@ -1784,6 +1863,12 @@ class PCVRHyFormer(nn.Module):
             seq_masks_list.append(mask)
 
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+
+        # Fourier time encoding on all tokens before attention blocks
+        for i, domain in enumerate(self.seq_domains):
+            seq_tokens_list[i] = seq_tokens_list[i] + self.time_fourier(inputs.seq_timestamps[domain])
+        ns_tokens = ns_tokens + self.time_fourier(inputs.timestamp.unsqueeze(-1))
+        q_tokens_list = [q + self.time_fourier(inputs.timestamp.unsqueeze(-1)) for q in q_tokens_list]
 
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,

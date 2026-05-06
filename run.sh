@@ -8,9 +8,9 @@ python3 -m zipfile -e "${SCRIPT_DIR}/src.zip" "${SCRIPT_DIR}"
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
 python3 -u -m src.train \
     --ns_tokenizer_type rankmixer \
-    --user_ns_tokens 5 \
-    --item_ns_tokens 2 \
-    --num_queries 2 \
+    --user_ns_tokens 10 \
+    --item_ns_tokens 6 \
+    --num_queries 3 \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
@@ -18,6 +18,13 @@ python3 -u -m src.train \
     --sparse_dtype float32 \
     --log_step 1 \
     --accumulation_steps 1 \
+    --use_amp \
+    --d_model 64 \
+    --num_heads 4 \
+    --dense_dtype float32 \
+    --sparse_dtype float32 \
+    --log_step 1 \
+    --accumulation_steps 1
     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----

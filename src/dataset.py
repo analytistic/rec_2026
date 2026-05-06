@@ -581,6 +581,14 @@ class PCVRParquetDataset(IterableDataset):
             '_seq_domains': self.seq_domains,
         }
 
+        # ---- Row-level time features for NS tokens ----
+        hour_val = ((timestamps % 86400) // 3600) + 1
+        dow_val = (((timestamps // 86400) + 4) % 7) + 1
+        weekend_val = (dow_val >= 6).astype(np.int64) + 1
+        result['hour'] = torch.from_numpy(hour_val)
+        result['dow'] = torch.from_numpy(dow_val)
+        result['weekend'] = torch.from_numpy(weekend_val)
+
         # ---- Sequence features: fused padding directly into the 3D buffer ----
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
@@ -592,7 +600,7 @@ class PCVRParquetDataset(IterableDataset):
             lengths = self._buf_seq_lens[domain][:B]
             lengths[:] = 0
 
-            # Fused path: first collect (offsets, values, vocab_size, col_idx)
+            # Fused path: collect (offsets, values, vocab_size, col_idx)
             # for every side-info column, then fill the buffer in a single pass.
             col_data = []
             for ci, slot, vs in side_plan:
@@ -617,6 +625,7 @@ class PCVRParquetDataset(IterableDataset):
             # Check out-of-bound values per feature's vocab_size.
             # vs==0 means no vocab info; force the whole slice to 0 so that
             # the model's 1-slot Embedding is never indexed out of range.
+            # Note: col_data only contains real features.
             for c, (_, _, vs, ci) in enumerate(col_data):
                 slice_c = out[:, c, :]
                 if vs > 0:
@@ -627,15 +636,15 @@ class PCVRParquetDataset(IterableDataset):
             result[domain] = torch.from_numpy(out.copy())
             result[f'{domain}_len'] = torch.from_numpy(lengths.copy())
 
-            # Time bucketing.
+            # Time bucketing + raw timestamp.
             time_bucket = self._buf_seq_tb[domain][:B]
             time_bucket[:] = 0
+            ts_padded = np.zeros((B, max_len), dtype=np.int64)
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
                 ts_vals = ts_col.values.to_numpy()
                 # Pad timestamps into shape (B, max_len).
-                ts_padded = np.zeros((B, max_len), dtype=np.int64)
                 for i in range(B):
                     s = int(ts_offs[i])
                     e = int(ts_offs[i + 1])
@@ -665,6 +674,7 @@ class PCVRParquetDataset(IterableDataset):
                 time_bucket[:] = buckets
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+            result[f'{domain}_timestamp'] = torch.from_numpy(ts_padded.copy())
 
         return result
 
