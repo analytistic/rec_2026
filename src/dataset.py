@@ -11,6 +11,8 @@ Optimizations:
   when using many DataLoader workers.
 """
 
+PAIRED_FIDS = frozenset({62, 63, 64, 65, 66, 89, 90, 91})
+
 import os
 import logging
 import random
@@ -24,6 +26,14 @@ import torch
 import torch.multiprocessing
 from torch.utils.data import IterableDataset, DataLoader
 from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+
+def _worker_init_fn(worker_id: int, base_seed: int) -> None:
+    """DataLoader worker init: seed numpy and torch RNGs per worker."""
+    seed_val = (base_seed + worker_id) % (2**32)
+    np.random.seed(seed_val)
+    torch.manual_seed(seed_val)
+
 
 # numpy.typing is available since numpy >= 1.20; on older numpy fall back to a
 # no-op shim so that forward-referenced annotations like ``npt.NDArray[np.int64]``
@@ -153,6 +163,8 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        ts_max: Optional[int] = None,
+        add_seq_time_attrs: bool = True,
     ) -> None:
         """
         Args:
@@ -170,8 +182,16 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            ts_max: if set, rows with timestamp > ``ts_max`` are filtered out
+                during iteration.  Used during training when the valid split is
+                pre-split by timestamp and training reads from the unfiltered
+                original data dir.
+            add_seq_time_attrs: if True, derive hour/dow/weekend from per-event
+                timestamps and include them as 3 additional seq features.
+                Set False via --no_seq_time_attrs.
         """
         super().__init__()
+        self.add_seq_time_attrs = add_seq_time_attrs
 
         # Accept either a directory or a single file path.
         if os.path.isdir(parquet_path):
@@ -188,6 +208,7 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
+        self.ts_max = ts_max
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -218,20 +239,24 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_user_int = np.zeros((B, self.user_int_schema.total_dim), dtype=np.int64)
         self._buf_item_int = np.zeros((B, self.item_int_schema.total_dim), dtype=np.int64)
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
+        self._buf_paired_int = np.zeros((B, self.paired_int_schema.total_dim), dtype=np.int64)
+        self._buf_paired_float = np.zeros((B, self.paired_float_schema.total_dim), dtype=np.float32)
         self._buf_seq = {}
         self._buf_seq_tb = {}
         self._buf_seq_lens = {}
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
             n_feats = len(self.sideinfo_fids[domain])
+            if self.add_seq_time_attrs and self.ts_fids[domain] is not None:
+                n_feats += 3  # virtual hour, dow, weekend features
             self._buf_seq[domain] = np.zeros((B, n_feats, max_len), dtype=np.int64)
             self._buf_seq_tb[domain] = np.zeros((B, max_len), dtype=np.int64)
             self._buf_seq_lens[domain] = np.zeros(B, dtype=np.int64)
 
-        # ---- Pre-compute (col_idx, offset, vocab_size) plans for int columns ----
-        self._user_int_plan = []  # [(col_idx, dim, offset, vocab_size), ...]
+        # ---- Pre-compute (col_idx, dim, offset, vocab_size) plans ----
+        self._user_int_plan = []  # non-paired int features only
         offset = 0
-        for fid, vs, dim in self._user_int_cols:
+        for fid, vs, dim in self._non_paired_int_cols:
             ci = self._col_idx.get(f'user_int_feats_{fid}')
             self._user_int_plan.append((ci, dim, offset, vs))
             offset += dim
@@ -243,12 +268,28 @@ class PCVRParquetDataset(IterableDataset):
             self._item_int_plan.append((ci, dim, offset, vs))
             offset += dim
 
-        self._user_dense_plan = []
+        self._user_dense_plan = []  # non-paired dense only (f61, f87)
         offset = 0
-        for fid, dim in self._user_dense_cols:
+        for fid, dim in self._non_paired_dense_cols:
             ci = self._col_idx.get(f'user_dense_feats_{fid}')
             self._user_dense_plan.append((ci, dim, offset))
             offset += dim
+
+        # Paired int plan: reads from user_int_feats_{fid} but writes into
+        # paired_int buffer (zeroed out in user_int buffer).
+        self._paired_int_plan = []
+        poff = 0
+        for fid, vs, dim in self._paired_int_cols:
+            ci = self._col_idx.get(f'user_int_feats_{fid}')
+            self._paired_int_plan.append((ci, dim, poff, vs))
+            poff += dim
+
+        self._paired_float_plan = []
+        poff = 0
+        for fid, dim in self._paired_dense_cols:
+            ci = self._col_idx.get(f'user_dense_feats_{fid}')
+            self._paired_float_plan.append((ci, dim, poff))
+            poff += dim
 
         # Sequence column plan: {domain: ([(col_idx, feat_slot, vocab_size), ...], ts_col_idx)}
         self._seq_plan = {}
@@ -275,12 +316,22 @@ class PCVRParquetDataset(IterableDataset):
             raw = json.load(f)
 
         # ---- user_int: [[fid, vocab_size, dim], ...] ----
+        # Split into paired (int+float) and non-paired (normal int features).
         self._user_int_cols: List[List[int]] = raw['user_int']
+        self._non_paired_int_cols = [c for c in self._user_int_cols if c[0] not in PAIRED_FIDS]
+        self._paired_int_cols   = [c for c in self._user_int_cols if c[0] in PAIRED_FIDS]
+
         self.user_int_schema: FeatureSchema = FeatureSchema()
         self.user_int_vocab_sizes: List[int] = []
-        for fid, vs, dim in self._user_int_cols:
+        for fid, vs, dim in self._non_paired_int_cols:
             self.user_int_schema.add(fid, dim)
             self.user_int_vocab_sizes.extend([vs] * dim)
+
+        self.paired_int_schema: FeatureSchema = FeatureSchema()
+        self.paired_int_vocab_sizes: List[int] = []
+        for fid, vs, dim in self._paired_int_cols:
+            self.paired_int_schema.add(fid, dim)
+            self.paired_int_vocab_sizes.extend([vs] * dim)
 
         # ---- item_int ----
         self._item_int_cols: List[List[int]] = raw['item_int']
@@ -291,10 +342,18 @@ class PCVRParquetDataset(IterableDataset):
             self.item_int_vocab_sizes.extend([vs] * dim)
 
         # ---- user_dense: [[fid, dim], ...] ----
+        # Split into ue (f61, f87 — pre-trained embeddings) and paired float parts.
         self._user_dense_cols: List[List[int]] = raw['user_dense']
+        self._non_paired_dense_cols = [c for c in self._user_dense_cols if c[0] not in PAIRED_FIDS]
+        self._paired_dense_cols     = [c for c in self._user_dense_cols if c[0] in PAIRED_FIDS]
+
         self.user_dense_schema: FeatureSchema = FeatureSchema()
-        for fid, dim in self._user_dense_cols:
+        for fid, dim in self._non_paired_dense_cols:
             self.user_dense_schema.add(fid, dim)
+
+        self.paired_float_schema: FeatureSchema = FeatureSchema()
+        for fid, dim in self._paired_dense_cols:
+            self.paired_float_schema.add(fid, dim)
 
         # ---- item_dense (empty) ----
         self.item_dense_schema: FeatureSchema = FeatureSchema()
@@ -322,9 +381,14 @@ class PCVRParquetDataset(IterableDataset):
 
             sideinfo = [fid for fid in all_fids if fid != ts_fid]
             self.sideinfo_fids[domain] = sideinfo
-            self.seq_domain_vocab_sizes[domain] = [
+            base_vocabs = [
                 self.seq_vocab_sizes[domain][fid] for fid in sideinfo
             ]
+            # Append 3 virtual time-attribute features (hour, dow, weekend)
+            # derived from per-event timestamp, controlled by add_seq_time_attrs.
+            if self.add_seq_time_attrs and ts_fid is not None:
+                base_vocabs += [24, 7, 2]
+            self.seq_domain_vocab_sizes[domain] = base_vocabs
 
             # max_len: from seq_max_lens arg; unspecified domains fall back to 256.
             self._seq_maxlen[domain] = seq_max_lens.get(domain, 256)
@@ -346,6 +410,17 @@ class PCVRParquetDataset(IterableDataset):
             pf = pq.ParquetFile(file_path)
             for batch in pf.iter_batches(batch_size=self.batch_size, row_groups=[rg_idx]):
                 batch_dict = self._convert_batch(batch)
+                if self.ts_max is not None:
+                    mask = batch_dict['timestamp'] <= self.ts_max
+                    keep = mask.sum().item()
+                    if keep == 0:
+                        continue
+                    if keep < batch_dict['timestamp'].shape[0]:
+                        for k, v in batch_dict.items():
+                            if isinstance(v, torch.Tensor):
+                                batch_dict[k] = v[mask]
+                            elif k == 'user_id':
+                                batch_dict[k] = [uid for uid, m in zip(v, mask.tolist()) if m]
                 if self.shuffle and self.buffer_batches > 1:
                     buffer.append(batch_dict)
                     if len(buffer) >= self.buffer_batches:
@@ -562,7 +637,7 @@ class PCVRParquetDataset(IterableDataset):
                     padded[:] = 0
                 item_int[:, offset:offset + dim] = padded
 
-        # ---- user_dense ----
+        # ---- user_dense (non-paired only: f61, f87) ----
         user_dense = self._buf_user_dense[:B]
         user_dense[:] = 0
         for ci, dim, offset in self._user_dense_plan:
@@ -570,11 +645,33 @@ class PCVRParquetDataset(IterableDataset):
             padded = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
 
+        # ---- paired int (from user_int_feats_{fid} columns into separate buffer) ----
+        paired_int = self._buf_paired_int[:B]
+        paired_int[:] = 0
+        for ci, dim, offset, vs in self._paired_int_plan:
+            col = batch.column(ci)
+            padded, _ = self._pad_varlen_int_column(col, dim, B)
+            if vs > 0:
+                self._record_oob('paired_int', ci, padded, vs)
+            else:
+                padded[:] = 0
+            paired_int[:, offset:offset + dim] = padded
+
+        # ---- paired float (from user_dense_feats_{fid} columns into separate buffer) ----
+        paired_float = self._buf_paired_float[:B]
+        paired_float[:] = 0
+        for ci, dim, offset in self._paired_float_plan:
+            col = batch.column(ci)
+            padded = self._pad_varlen_float_column(col, dim, B)
+            paired_float[:, offset:offset + dim] = padded
+
         result = {
             'user_int_feats': torch.from_numpy(user_int.copy()),
             'user_dense_feats': torch.from_numpy(user_dense.copy()),
             'item_int_feats': torch.from_numpy(item_int.copy()),
             'item_dense_feats': torch.zeros(B, 0, dtype=torch.float32),
+            'paired_int_feats': torch.from_numpy(paired_int.copy()),
+            'paired_float_feats': torch.from_numpy(paired_float.copy()),
             'label': torch.from_numpy(labels),
             'timestamp': torch.from_numpy(timestamps),
             'user_id': user_ids,
@@ -583,7 +680,7 @@ class PCVRParquetDataset(IterableDataset):
 
         # ---- Row-level time features for NS tokens ----
         hour_val = ((timestamps % 86400) // 3600) + 1
-        dow_val = (((timestamps // 86400) + 4) % 7) + 1
+        dow_val = (((timestamps // 86400) + 3) % 7) + 1  # Mon=1 .. Sun=7
         weekend_val = (dow_val >= 6).astype(np.int64) + 1
         result['hour'] = torch.from_numpy(hour_val)
         result['dow'] = torch.from_numpy(dow_val)
@@ -633,12 +730,8 @@ class PCVRParquetDataset(IterableDataset):
                 else:
                     slice_c[:] = 0
 
-            result[domain] = torch.from_numpy(out.copy())
-            result[f'{domain}_len'] = torch.from_numpy(lengths.copy())
-
-            # Time bucketing + raw timestamp.
-            time_bucket = self._buf_seq_tb[domain][:B]
-            time_bucket[:] = 0
+            # Compute ts_padded before result copy so virtual time attrs
+            # can be filled into the buffer before it is snapshotted.
             ts_padded = np.zeros((B, max_len), dtype=np.int64)
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
@@ -654,6 +747,27 @@ class PCVRParquetDataset(IterableDataset):
                     ul = min(rl, max_len)
                     ts_padded[i, :ul] = ts_vals[s:s + ul]
 
+                # Virtual time attrs: hour/dow/weekend from per-event timestamp
+                if self.add_seq_time_attrs:
+                    n_real = len(self.sideinfo_fids[domain])
+                    valid_events = ts_padded > 0
+                    if valid_events.any():
+                        ts_sec = ts_padded[valid_events]
+                        # hour: 0-23 → 1-24
+                        out[:, n_real, :][valid_events] = ((ts_sec % 86400) // 3600) + 1
+                        # dow: Mon=0 → 1-7
+                        dow_raw = ((ts_sec // 86400) + 3) % 7
+                        out[:, n_real + 1, :][valid_events] = dow_raw.astype(np.int64) + 1
+                        # weekend: workday=1, weekend=2
+                        out[:, n_real + 2, :][valid_events] = (dow_raw >= 5).astype(np.int64) + 1
+
+            result[domain] = torch.from_numpy(out.copy())
+            result[f'{domain}_len'] = torch.from_numpy(lengths.copy())
+
+            # Time bucketing (uses ts_padded computed above).
+            time_bucket = self._buf_seq_tb[domain][:B]
+            time_bucket[:] = 0
+            if ts_ci is not None:
                 ts_expanded = timestamps.reshape(-1, 1)
                 time_diff = np.maximum(ts_expanded - ts_padded, 0)
                 # np.searchsorted returns values in [0, len(BUCKET_BOUNDARIES)].
@@ -691,12 +805,20 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    valid_data_dir: Optional[str] = None,
+    add_seq_time_attrs: bool = True,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
 
-    The validation split is taken as the last ``valid_ratio`` fraction of Row
-    Groups (in the file order returned by ``glob``).
+    When ``valid_data_dir`` is provided, train reads all data from ``data_dir``
+    and validation reads all data from ``valid_data_dir`` (the caller is
+    responsible for ensuring strict time separation).  ``valid_ratio`` and
+    ``train_ratio`` are ignored in this mode.
+
+    When ``valid_data_dir`` is ``None`` (default), validation is taken as the
+    last ``valid_ratio`` fraction of Row Groups in file-glob order (fast but
+    may cause time leakage).
 
     Returns:
         A tuple ``(train_loader, valid_loader, train_dataset)``. The third
@@ -707,65 +829,126 @@ def get_pcvr_data(
     random.seed(seed)
 
     import glob as _glob
-    pq_files = sorted(_glob.glob(os.path.join(data_dir, '*.parquet')))
-
-    rg_info = []
-    for f in pq_files:
-        pf = pq.ParquetFile(f)
-        for i in range(pf.metadata.num_row_groups):
-            rg_info.append((f, i, pf.metadata.row_group(i).num_rows))
-    total_rgs = len(rg_info)
-
-    n_valid_rgs = max(1, int(total_rgs * valid_ratio))
-    n_train_rgs = total_rgs - n_valid_rgs
-
-    # train_ratio: use only the first N% of the training Row Groups.
-    if train_ratio <= 1.0:
-        n_train_rgs = max(1, int(n_train_rgs * train_ratio))
-        logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
-
-    train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
-    valid_rows = sum(r[2] for r in rg_info[-n_valid_rgs:])
-
-    logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
-                 f"{n_valid_rgs} valid ({valid_rows} rows)")
-
-    train_dataset = PCVRParquetDataset(
-        parquet_path=data_dir,
-        schema_path=schema_path,
-        batch_size=batch_size,
-        seq_max_lens=seq_max_lens,
-        shuffle=shuffle_train,
-        buffer_batches=buffer_batches,
-        row_group_range=(0, n_train_rgs),
-        clip_vocab=clip_vocab,
-    )
 
     use_cuda = torch.cuda.is_available()
+    from functools import partial
+
     _train_kw = {}
     if num_workers > 0:
         _train_kw['persistent_workers'] = True
         _train_kw['prefetch_factor'] = 2
+        _train_kw['worker_init_fn'] = partial(_worker_init_fn, base_seed=seed)
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=None,
-        num_workers=num_workers, pin_memory=use_cuda, **_train_kw,
-    )
+    if valid_data_dir is not None:
+        # ── Pre-split mode: data_dir = train, valid_data_dir = valid ──
+        # Auto-detect threshold.json written by preprocess_split_by_timestamp
+        ts_max = None
+        threshold_path = os.path.join(
+            os.path.dirname(valid_data_dir.rstrip('/')), 'threshold.json')
+        if os.path.exists(threshold_path):
+            with open(threshold_path) as f:
+                ts_max = json.load(f)['threshold']
+            logging.info(f"Auto-detected ts_max={ts_max} for train from {threshold_path}")
 
-    valid_dataset = PCVRParquetDataset(
-        parquet_path=data_dir,
-        schema_path=schema_path,
-        batch_size=batch_size,
-        seq_max_lens=seq_max_lens,
-        shuffle=False,
-        buffer_batches=0,
-        row_group_range=(total_rgs - n_valid_rgs, total_rgs),
-        clip_vocab=clip_vocab,
-    )
-    valid_loader = DataLoader(
-        valid_dataset, batch_size=None,
-        num_workers=0, pin_memory=use_cuda,
-    )
+        train_dataset = PCVRParquetDataset(
+            parquet_path=data_dir,
+            schema_path=schema_path,
+            batch_size=batch_size,
+            seq_max_lens=seq_max_lens,
+            shuffle=shuffle_train,
+            buffer_batches=buffer_batches,
+            row_group_range=None,  # read all row groups
+            clip_vocab=clip_vocab,
+            ts_max=ts_max,
+            add_seq_time_attrs=add_seq_time_attrs,
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_size=None,
+            num_workers=num_workers, pin_memory=use_cuda, **_train_kw,
+        )
+
+        valid_dataset = PCVRParquetDataset(
+            parquet_path=valid_data_dir,
+            schema_path=schema_path,
+            batch_size=batch_size,
+            seq_max_lens=seq_max_lens,
+            shuffle=False,
+            buffer_batches=0,
+            row_group_range=None,
+            clip_vocab=clip_vocab,
+            add_seq_time_attrs=add_seq_time_attrs,
+        )
+        valid_loader = DataLoader(
+            valid_dataset, batch_size=None,
+            num_workers=num_workers, pin_memory=use_cuda,
+        )
+
+        # count rows for logging
+        train_rows = sum(
+            pq.ParquetFile(f).metadata.row_group(i).num_rows
+            for f in sorted(_glob.glob(os.path.join(data_dir, '*.parquet')))
+            for i in range(pq.ParquetFile(f).metadata.num_row_groups)
+        )
+        valid_rows = sum(
+            pq.ParquetFile(f).metadata.row_group(i).num_rows
+            for f in sorted(_glob.glob(os.path.join(valid_data_dir, '*.parquet')))
+            for i in range(pq.ParquetFile(f).metadata.num_row_groups)
+        )
+        logging.info(f"Pre-split data: train from {data_dir}, valid from {valid_data_dir}")
+    else:
+        # ── Default mode: single data_dir, split by row_group ──
+        pq_files = sorted(_glob.glob(os.path.join(data_dir, '*.parquet')))
+        rg_info = []
+        for f in pq_files:
+            pf = pq.ParquetFile(f)
+            for i in range(pf.metadata.num_row_groups):
+                rg_info.append((f, i, pf.metadata.row_group(i).num_rows))
+        total_rgs = len(rg_info)
+
+        n_valid_rgs = max(1, int(total_rgs * valid_ratio))
+        n_train_rgs = total_rgs - n_valid_rgs
+
+        if train_ratio <= 1.0:
+            n_train_rgs = max(1, int(n_train_rgs * train_ratio))
+            logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
+
+        train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
+        valid_rows = sum(r[2] for r in rg_info[-n_valid_rgs:])
+
+        logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
+                     f"{n_valid_rgs} valid ({valid_rows} rows)")
+
+        train_dataset = PCVRParquetDataset(
+            parquet_path=data_dir,
+            schema_path=schema_path,
+            batch_size=batch_size,
+            seq_max_lens=seq_max_lens,
+            shuffle=shuffle_train,
+            buffer_batches=buffer_batches,
+            row_group_range=(0, n_train_rgs),
+            clip_vocab=clip_vocab,
+            add_seq_time_attrs=add_seq_time_attrs,
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_size=None,
+            num_workers=num_workers, pin_memory=use_cuda, **_train_kw,
+        )
+
+        valid_dataset = PCVRParquetDataset(
+            parquet_path=data_dir,
+            schema_path=schema_path,
+            batch_size=batch_size,
+            seq_max_lens=seq_max_lens,
+            shuffle=False,
+            buffer_batches=0,
+            row_group_range=(total_rgs - n_valid_rgs, total_rgs),
+            clip_vocab=clip_vocab,
+            add_seq_time_attrs=add_seq_time_attrs,
+        )
+        valid_loader = DataLoader(
+            valid_dataset, batch_size=None,
+            num_workers=0, pin_memory=use_cuda,
+        )
 
     logging.info(f"Parquet train: {train_rows} rows, valid: {valid_rows} rows, "
                  f"batch_size={batch_size}, buffer_batches={buffer_batches}")

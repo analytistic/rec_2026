@@ -1,0 +1,22 @@
+{
+  "user_ns_groups": {
+    "u_high":        [65, 66],
+    "u_est_multi":   [80, 82, 62, 63, 64],
+    "u_interest":    [15],
+    "u_demo_low":    [1, 49, 50, 55, 58, 59, 60],
+    "u_demo_mid1":   [48, 51, 52, 57],
+    "u_demo_mid2":   [86, 53],
+    "u_demo_high1":  [3, 4],
+    "u_demo_high2":  [54, 56],
+    "u_sparse_a":    [92, 93, 94, 95, 96, 97, 98, 108, 109],
+    "u_sparse_b":    [99, 100, 101, 102, 103, 104, 105, 106, 107]
+  },
+  "item_ns_groups": {
+    "i_tag_single":  [13],
+    "i_cat_basic":   [9, 10, 5, 6],
+    "i_cat_high":    [7, 8, 12],
+    "i_mega":        [11, 16],
+    "i_meta":        [81, 83, 84, 85]
+  }
+}
+ 

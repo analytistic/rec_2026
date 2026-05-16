@@ -50,6 +50,8 @@ class PCVRHyFormerRankingTrainer:
         loss_type: str = 'bce',
         focal_alpha: float = 0.1,
         focal_gamma: float = 2.0,
+        focal_weight: float = 0.0,
+        focal_start_epoch: int = 0,
         sparse_lr: float = 0.05,
         sparse_weight_decay: float = 0.0,
         reinit_sparse_after_epoch: int = 1,
@@ -105,6 +107,8 @@ class PCVRHyFormerRankingTrainer:
         self.loss_type: str = loss_type
         self.focal_alpha: float = focal_alpha
         self.focal_gamma: float = focal_gamma
+        self.focal_weight: float = focal_weight
+        self.focal_start_epoch: int = focal_start_epoch
         self.reinit_sparse_after_epoch: int = reinit_sparse_after_epoch
         self.reinit_cardinality_threshold: int = reinit_cardinality_threshold
         self.sparse_lr: float = sparse_lr
@@ -117,7 +121,7 @@ class PCVRHyFormerRankingTrainer:
         self.accumulation_steps: int = accumulation_steps
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
-                     f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
+                     f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, focal_weight={focal_weight}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
@@ -275,9 +279,8 @@ class PCVRHyFormerRankingTrainer:
         )
         self.early_stopping.checkpoint_path = os.path.join(best_dir, "model.pt")
 
-        # Remove stale best dirs first so EarlyStopping's write is the only
-        # I/O needed when a new best is confirmed.
-        self._remove_old_best_dirs()
+        # (Keep all best_model dirs — the user prefers to retain every
+        # checkpoint for post-hoc analysis.)
 
         self.early_stopping(val_auc, self.model, {
             "best_val_AUC": val_auc,
@@ -305,10 +308,10 @@ class PCVRHyFormerRankingTrainer:
         global_step = 0
         steps_in_epoch = math.ceil(len(self.train_loader) / self.accumulation_steps)
         total_steps = steps_in_epoch * self.num_epochs
+        interval_sum = 0.0
 
         for epoch in range(1, self.num_epochs + 1):
             loss_sum = 0.0
-            interval_sum = 0.0
             epoch_start = time.time()
             last_log = epoch_start
             epoch_step = 0
@@ -320,7 +323,7 @@ class PCVRHyFormerRankingTrainer:
 
             for batch in self.train_loader:
                 micro_step += 1
-                loss = self._training_step(batch, micro_step)
+                loss = self._training_step(batch, micro_step, epoch)
                 loss_sum += loss
                 interval_sum += loss
 
@@ -392,6 +395,9 @@ class PCVRHyFormerRankingTrainer:
 
                         self._handle_validation_result(global_step, val_auc, val_logloss)
 
+                        # Save checkpoint at every validation step, keep all.
+                        self._save_step_checkpoint(global_step, is_best=True)
+
                         if self.early_stopping.early_stop:
                             logging.info(f"Early stopping at step {global_step}")
                             return
@@ -410,6 +416,9 @@ class PCVRHyFormerRankingTrainer:
                 self.writer.add_scalar('LogLoss/valid', val_logloss, global_step)
 
             self._handle_validation_result(global_step, val_auc, val_logloss)
+
+            # Save checkpoint at every epoch-end validation, keep all.
+            self._save_step_checkpoint(global_step, is_best=True)
 
             if self.early_stopping.early_stop:
                 logging.info(f"Early stopping at epoch {epoch}")
@@ -473,6 +482,8 @@ class PCVRHyFormerRankingTrainer:
             item_int_feats=device_batch['item_int_feats'],
             user_dense_feats=device_batch['user_dense_feats'],
             item_dense_feats=device_batch['item_dense_feats'],
+            paired_int_feats=device_batch.get('paired_int_feats'),
+            paired_float_feats=device_batch.get('paired_float_feats'),
             seq_data=seq_data,
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
@@ -483,7 +494,7 @@ class PCVRHyFormerRankingTrainer:
             weekend=weekend,
         )
 
-    def _training_step(self, batch: Dict[str, Any], step: int) -> float:
+    def _training_step(self, batch: Dict[str, Any], step: int, epoch: int = 0) -> float:
         """Forward + backward for one micro-batch.
 
         Returns the raw (unscaled) loss for logging. Backward uses
@@ -494,14 +505,21 @@ class PCVRHyFormerRankingTrainer:
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
 
+        # Before focal_start_epoch, use BCE regardless of loss_type.
+        use_focal = epoch >= self.focal_start_epoch
+
         amp_ctx = torch.amp.autocast('cuda', dtype=torch.bfloat16) if self.use_amp else contextlib.nullcontext()
         with amp_ctx:
             model_input = self._make_model_input(device_batch)
-            logits = self.model(model_input)  # (B, 1)
+            logits = self.model(model_input).logits  # (B, 1)
         logits = logits.squeeze(-1)  # (B,)
 
-        if self.loss_type == 'focal':
+        if use_focal and self.loss_type == 'focal':
             loss = sigmoid_focal_loss(logits.float(), label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+        elif use_focal and self.loss_type == 'bce_focal':
+            bce = F.binary_cross_entropy_with_logits(logits.float(), label)
+            focal = sigmoid_focal_loss(logits.float(), label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            loss = bce + self.focal_weight * focal
         else:
             loss = F.binary_cross_entropy_with_logits(logits.float(), label)
 
@@ -515,6 +533,9 @@ class PCVRHyFormerRankingTrainer:
 
         NaN predictions (which can arise from exploding gradients) are filtered
         out before computing both metrics.
+
+        When ``self.writer`` is available, also computes NS token effective rank
+        and logs it to TensorBoard.
         """
         print("Start Evaluation (PCVRHyFormer) - validation")
         self.model.eval()
@@ -523,14 +544,17 @@ class PCVRHyFormerRankingTrainer:
 
         all_logits_list = []
         all_labels_list = []
+        all_ns_list = []
         n_valid_batches = len(self.valid_loader)
         eval_start = time.time()
 
         with torch.no_grad():
             for step, batch in enumerate(self.valid_loader):
-                logits, labels = self._evaluate_step(batch)
+                logits, labels, ns_tokens = self._evaluate_step(batch, return_ns=self.writer is not None)
                 all_logits_list.append(logits.detach().cpu())
                 all_labels_list.append(labels.detach().cpu())
+                if ns_tokens is not None:
+                    all_ns_list.append(ns_tokens.detach().cpu())
                 if self.log_step > 0 and (step + 1) % self.log_step == 0:
                     logging.info(f"Valid batch {step + 1}/{n_valid_batches}, "
                                  f"elapsed: {time.time() - eval_start:.0f}s")
@@ -564,20 +588,67 @@ class PCVRHyFormerRankingTrainer:
         else:
             logloss = float('inf')
 
+        # Effective rank analysis
+        if self.writer is not None and len(all_ns_list) > 0:
+            try:
+                ns_tokens = torch.cat(all_ns_list, dim=0)  # (N, num_ns, D)
+                self._log_effective_rank(ns_tokens, epoch)
+            except Exception as e:
+                logging.warning(f"Effective rank computation failed: {e}")
+
         return auc, logloss
 
     def _evaluate_step(
-        self, batch: Dict[str, Any]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run a single validation step and return ``(logits, labels)``."""
+        self, batch: Dict[str, Any], return_ns: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Run a single validation step and return ``(logits, labels, ns_tokens)``."""
         device_batch = self._batch_to_device(batch)
         label = device_batch['label']
 
         amp_ctx = torch.amp.autocast('cuda', dtype=torch.bfloat16) if self.use_amp else contextlib.nullcontext()
         with amp_ctx:
             model_input = self._make_model_input(device_batch)
-            logits, embeddings = self.model.predict(model_input)  # (B, 1), (B, D)
-            del embeddings  # release immediately, not needed
+            out = self.model.predict(model_input)
+            logits = out.logits  # (B, 1)
+            ns_tokens = out.ns_tokens if return_ns else None  # (B, num_ns, D)
         logits = logits.squeeze(-1)  # (B,)
 
-        return logits, label
+        return logits, label, ns_tokens
+
+    def _log_effective_rank(self, ns_tokens: torch.Tensor, step: int) -> None:
+        """Compute per-group effective rank and log to TensorBoard.
+
+        Effective rank = exp(-Σ p_i log(p_i)),  p_i = σ_i / Σ σ_i.
+        A value close to D (= d_model) means all dimensions are used;
+        a low value means the group representation is collapsed.
+        """
+        N, num_ns, D = ns_tokens.shape
+
+        # Subsample to keep SVD fast
+        if N > 2000:
+            idx = torch.randperm(N, device=ns_tokens.device)[:2000]
+            ns_tokens = ns_tokens[idx]
+            N = 2000
+
+        for i in range(num_ns):
+            X = ns_tokens[:, i, :]                     # (N, D)
+            X = X - X.mean(dim=0, keepdim=True)         # center
+            S = torch.linalg.svdvals(X)                 # (k,)  k = min(N, D)
+            p = S / (S.sum() + 1e-10)
+            entropy = -(p * torch.log(p + 1e-10)).sum()
+            eff_rank = torch.exp(entropy).item()
+            self.writer.add_scalar(f'EffectiveRank/ns_group_{i}', eff_rank, step)
+
+        # Summary: average over groups
+        X_all = ns_tokens.reshape(-1, D)               # (N*num_ns, D)
+        X_all = X_all - X_all.mean(dim=0, keepdim=True)
+        S_all = torch.linalg.svdvals(X_all)
+        p_all = S_all / (S_all.sum() + 1e-10)
+        ent_all = -(p_all * torch.log(p_all + 1e-10)).sum()
+        eff_rank_all = torch.exp(ent_all).item()
+        self.writer.add_scalar(f'EffectiveRank/avg', eff_rank_all, step)
+        self.writer.add_scalar(f'EffectiveRank/fraction_of_D', eff_rank_all / D, step)
+        logging.info(
+            f"Effective rank: avg={eff_rank_all:.2f} / {D} "
+            f"({eff_rank_all / D * 100:.1f}%) over {num_ns} groups × {N} samples"
+        )

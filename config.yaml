@@ -1,0 +1,103 @@
+# PCVRHyFormer training configuration
+# Usage: python3 -m src.train --config config.yaml [CLI overrides]
+
+# ─── Paths ──────────────────────────────────────────────────────────────────
+# data_dir, ckpt_dir, log_dir are typically set via env vars or CLI overrides
+data_dir: data
+schema_path: ""
+ckpt_dir: output
+log_dir: output
+
+# ─── Training ────────────────────────────────────────────────────────────────
+batch_size: 256
+lr: 0.0001
+num_epochs: 999
+patience: 5
+seed: 42
+train_ratio: 1.0
+valid_ratio: 0.1
+valid_data_dir: null
+eval_every_n_steps: 0
+log_step: 100
+accumulation_steps: 1
+seq_max_lens: "seq_a:256,seq_b:256,seq_c:512,seq_d:512"
+num_workers: 1
+buffer_batches: 20
+
+# ─── Dtype ───────────────────────────────────────────────────────────────────
+dense_dtype: float32
+sparse_dtype: float32
+use_amp: true
+
+# ─── Model ───────────────────────────────────────────────────────────────────
+d_model: 64
+emb_dim: 64
+num_queries: 4
+num_hyformer_blocks: 2
+num_heads: 4
+hidden_mult: 4
+seq_encoder_type: transformer
+seq_top_k: 50
+seq_causal: false
+action_num: 1
+
+# ─── Dropout ─────────────────────────────────────────────────────────────────
+embed_dropout_rate: 0.04
+seq_id_dropout_rate: 0.06
+hidden_dropout_rate: 0.02
+
+# ─── Normalization ───────────────────────────────────────────────────────────
+norm_type: layer
+use_rope: false
+rope_base: 10000.0
+
+# ─── Feature processing ─────────────────────────────────────────────────────
+emb_skip_threshold: 1000000
+seq_id_threshold: 100
+ns_tokenizer_type: rankmixer
+user_ns_tokens: 9
+item_ns_tokens: 4
+ns_groups_json: ""
+rank_mixer_mode: full
+
+# ─── FFN ─────────────────────────────────────────────────────────────────────
+ffn_name: shared
+ffn_config: {}
+mixer_type: rank
+seq_ffn_name: shared
+seq_ffn_config: {}
+
+# ─── Sequence projection ─────────────────────────────────────────────────────
+seq_proj_type: linear
+
+# ─── Time features ───────────────────────────────────────────────────────────
+use_time_buckets: true
+fourier_seq: false
+fourier_ns: false
+use_row_time_ns: true
+add_seq_time_attrs: true
+
+# ─── Domain Embedding ─────────────────────────────────────────────────────────
+use_domain_emb: true
+
+# ─── Loss ────────────────────────────────────────────────────────────────────
+# loss_type: bce | focal | bce_focal
+#   focal:       FL(p_t) = -alpha_t * (1-p_t)^gamma * log(p_t)
+#   bce_focal:   BCE + focal_weight * focal (warm-start BCE then add focal)
+# focal_alpha: alpha_t = alpha if pos, 1-alpha if neg. Higher = more weight on positives.
+# focal_gamma: higher = more aggressive down-weighting of easy examples
+# focal_start_epoch: before this epoch, use BCE regardless of loss_type
+loss_type: bce
+focal_alpha: 0.4
+focal_gamma: 2.0
+focal_weight: 1.0
+focal_start_epoch: 2
+
+# ─── Sparse optimizer ───────────────────────────────────────────────────────
+sparse_lr: 0.05
+sparse_weight_decay: 0.0
+reinit_sparse_after_epoch: 1
+reinit_cardinality_threshold: 0
+
+# ─── Inference ───────────────────────────────────────────────────────────────
+# (infer.py reads from train_config.json, not this config)

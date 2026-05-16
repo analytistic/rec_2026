@@ -2,41 +2,25 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
-# Unzip source code (src.zip shipped alongside this script)
 python3 -m zipfile -e "${SCRIPT_DIR}/src.zip" "${SCRIPT_DIR}"
 
-# ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
-python3 -u -m src.train \
-    --ns_tokenizer_type rankmixer \
-    --user_ns_tokens 10 \
-    --item_ns_tokens 6 \
-    --num_queries 3 \
-    --ns_groups_json "" \
-    --emb_skip_threshold 1000000 \
-    --num_workers 8 \
-    --dense_dtype float32 \
-    --sparse_dtype float32 \
-    --log_step 1 \
-    --accumulation_steps 1 \
-    --use_amp \
-    --d_model 64 \
-    --num_heads 4 \
-    --dense_dtype float32 \
-    --sparse_dtype float32 \
-    --log_step 1 \
-    --accumulation_steps 1
-    "$@"
+# python3 -u -m src.analyze_time_dist \
+    --data_dir $TRAIN_DATA_PATH \
+    --valid_dir $USER_CACHE_PATH/valid \
+    --threshold_json $USER_CACHE_PATH/threshold.json \
 
-# ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----
-# Uses feature grouping from ns_groups.json (7 user groups + 4 item groups).
-# With d_model=64 and num_ns=12 (7 user_int + 1 user_dense + 4 item_int),
-# only num_queries=1 satisfies d_model % T == 0 (T = num_queries*4 + num_ns).
-# To switch, comment out the block above and uncomment the block below.
-#
-# python3 -u "${SCRIPT_DIR}/train.py" \
-#     --ns_tokenizer_type group \
-#     --ns_groups_json "${SCRIPT_DIR}/ns_groups.json" \
-#     --num_queries 1 \
-#     --emb_skip_threshold 1000000 \
-#     --num_workers 8 \
-#     "$@"
+
+# ---- Step 1 (optional): Pre-split data by timestamp into USER_CACHE_PATH ----
+# Uncomment to run preprocessing. Comment out after first run to skip.
+# python3 -u -m src.preprocess_split_by_timestamp --valid_ratio 0.1
+
+# ---- Step 2: Train ----
+# Valid reads from pre-split cache (strict time separation).
+python3 -u -m src.train \
+    --config "${SCRIPT_DIR}/config.yaml" \
+    --data_dir "${TRAIN_DATA_PATH}" \
+    --ckpt_dir "${TRAIN_CKPT_PATH}" \
+    --log_dir "${TRAIN_LOG_PATH}" \
+    --ns_groups_json "${SCRIPT_DIR}/v1.json" \
+    #--valid_data_dir "${USER_CACHE_PATH}/valid" \
+    "$@"

@@ -1,0 +1,75 @@
+# Debug config for local development
+data_dir: data
+schema_path: ""
+ckpt_dir: output
+log_dir: output
+
+batch_size: 256
+lr: 0.0001
+num_epochs: 999
+patience: 5
+seed: 42
+train_ratio: 1.0
+valid_ratio: 0.1
+valid_data_dir: null
+eval_every_n_steps: 0
+log_step: 1
+accumulation_steps: 2
+seq_max_lens: "seq_a:256,seq_b:256,seq_c:512,seq_d:512"
+num_workers: 1
+buffer_batches: 20
+
+dense_dtype: float32
+sparse_dtype: float32
+use_amp: true
+
+d_model: 64
+emb_dim: 64
+num_queries: 4
+num_hyformer_blocks: 2
+num_heads: 4
+hidden_mult: 4
+seq_encoder_type: transformer
+seq_top_k: 50
+seq_causal: false
+action_num: 1
+
+embed_dropout_rate: 0.04
+seq_id_dropout_rate: 0.06
+hidden_dropout_rate: 0.02
+
+norm_type: layer
+use_rope: false
+rope_base: 10000.0
+
+emb_skip_threshold: 100
+seq_id_threshold: 100
+ns_tokenizer_type: rankmixer
+user_ns_tokens: 9
+item_ns_tokens: 4
+ns_groups_json: ""
+rank_mixer_mode: full
+
+ffn_name: shared
+ffn_config: {}
+mixer_type: rank
+seq_ffn_name: shared
+seq_ffn_config: {}
+
+seq_proj_type: linear
+
+use_time_buckets: true
+fourier_seq: false
+fourier_ns: false
+use_row_time_ns: true
+add_seq_time_attrs: true
+use_domain_emb: true
+
+loss_type: bce
+focal_alpha: 0.1
+focal_gamma: 2.0
+
+sparse_lr: 0.05
+sparse_weight_decay: 0.0
+reinit_sparse_after_epoch: 1
+reinit_cardinality_threshold: 0

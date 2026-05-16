@@ -1,12 +1,13 @@
 """PCVRHyFormer training entry point (self-contained baseline).
 
 Usage:
-    python train.py [--num_epochs 10] [--batch_size 256] ...
+    python -m src.train --config config.yaml [--data_dir ...]
 
-Environment variables (take precedence over CLI flags):
+Environment variables (take precedence over CLI flags and config file):
     TRAIN_DATA_PATH  Training data directory (*.parquet + schema.json)
     TRAIN_CKPT_PATH  Checkpoint output directory
     TRAIN_LOG_PATH   Log directory
+    TRAIN_TF_EVENTS_PATH  TensorBoard events directory
 """
 
 import os
@@ -14,8 +15,9 @@ import json
 import argparse
 import logging
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
+import yaml
 import torch
 
 from .utils import set_seed, EarlyStopping, create_logger
@@ -45,246 +47,117 @@ def build_feature_specs(
     return specs
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args_and_config() -> Dict[str, Any]:
+    """Parse --config + minimal CLI overrides, merge into single config dict.
+
+    Precedence (higher wins):  env vars > CLI args > config file
+    """
     parser = argparse.ArgumentParser(description="PCVRHyFormer Training")
+    parser.add_argument('--config', type=str, default='config.yaml',
+                        help='Path to YAML config file')
 
-    # Paths (environment variables take precedence).
-    parser.add_argument('--data_dir', type=str, default='data',
+    # CLI overrides (all optional; values in config.yaml are the defaults).
+    parser.add_argument('--data_dir', type=str, default=None,
                         help='Training data directory (env: TRAIN_DATA_PATH)')
-    parser.add_argument('--schema_path', type=str, default='',
+    parser.add_argument('--schema_path', type=str, default=None,
                         help='Schema JSON path (defaults to <data_dir>/schema.json)')
-    parser.add_argument('--ckpt_dir', type=str, default='output',
+    parser.add_argument('--ckpt_dir', type=str, default=None,
                         help='Checkpoint output directory (env: TRAIN_CKPT_PATH)')
-    parser.add_argument('--log_dir', type=str, default='output',
+    parser.add_argument('--log_dir', type=str, default=None,
                         help='Log directory (env: TRAIN_LOG_PATH)')
-
-    # Training hyperparameters.
-    parser.add_argument('--batch_size', type=int, default=256,
-                        help='Batch size for both training and validation')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='Learning rate for dense parameters (AdamW)')
-    parser.add_argument('--num_epochs', type=int, default=999,
-                        help='Maximum number of training epochs '
-                             '(typically terminated earlier by early stopping)')
-    parser.add_argument('--patience', type=int, default=5,
-                        help='Early-stopping patience '
-                             '(number of validations without improvement)')
-    parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed')
-    parser.add_argument('--device', type=str,
-                        default='cuda' if torch.cuda.is_available() else 'cpu',
+    parser.add_argument('--valid_data_dir', type=str, default=None,
+                        help='Separate validation data directory')
+    parser.add_argument('--ns_groups_json', type=str, default=None,
+                        help='Path to NS-groups JSON')
+    parser.add_argument('--device', type=str, default=None,
                         help='Training device, e.g. cuda or cpu')
-
-    # Dtype control.
-    parser.add_argument('--dense_dtype', type=str, default='bfloat16',
-                        choices=['float32', 'bfloat16', 'float16'],
-                        help='Dtype for dense parameters (Linear, LayerNorm, etc.)')
-    parser.add_argument('--sparse_dtype', type=str, default='float32',
-                        choices=['float32', 'bfloat16'],
-                        help='Dtype for sparse parameters (Embedding tables)')
-    parser.add_argument('--use_amp', action='store_true', default=False,
-                        help='Enable bfloat16 autocast during forward pass '
-                             '(prevents attention softmax from running in low precision)')
-
-    # Data pipeline.
-    parser.add_argument('--num_workers', type=int, default=16,
+    parser.add_argument('--num_workers', type=int, default=None,
                         help='Number of DataLoader workers')
-    parser.add_argument('--buffer_batches', type=int, default=20,
-                        help='Shuffle buffer size, in units of batches. '
-                             'Lower values reduce memory usage.')
-    parser.add_argument('--train_ratio', type=float, default=1.0,
-                        help='Fraction of training Row Groups to use (takes the first N%)')
-    parser.add_argument('--valid_ratio', type=float, default=0.1,
-                        help='Fraction of all Row Groups used for validation (takes the tail)')
-    parser.add_argument('--eval_every_n_steps', type=int, default=0,
-                        help='Run validation every N steps '
-                             '(0 = only at the end of each epoch)')
-    parser.add_argument('--log_step', type=int, default=100,
-                        help='Log training loss every N steps '
-                             '(0 = only log epoch average)')
-    parser.add_argument('--accumulation_steps', type=int, default=1,
-                        help='Number of micro-batches to accumulate gradients over. '
-                             'Effective batch = batch_size * accumulation_steps')
-    parser.add_argument('--seq_max_lens', type=str,
-                        default='seq_a:256,seq_b:256,seq_c:512,seq_d:512',
-                        help='Per-domain sequence truncation, format: seq_d:256,seq_c:128')
 
-    # Model hyperparameters.
-    parser.add_argument('--d_model', type=int, default=64,
-                        help='Backbone hidden dimension (output size of each block)')
-    parser.add_argument('--emb_dim', type=int, default=64,
-                        help='Per-Embedding-table dimension (before projection)')
-    parser.add_argument('--num_queries', type=int, default=1,
-                        help='Number of Query tokens generated independently per sequence domain')
-    parser.add_argument('--num_hyformer_blocks', type=int, default=2,
-                        help='Number of stacked MultiSeqHyFormerBlock layers')
-    parser.add_argument('--num_heads', type=int, default=4,
-                        help='Number of attention heads (must satisfy d_model %% num_heads == 0)')
-    parser.add_argument('--seq_encoder_type', type=str, default='transformer',
-                        choices=['swiglu', 'transformer', 'longer'],
-                        help='Sequence encoder variant: '
-                             'swiglu = SwiGLU without attention, '
-                             'transformer = standard self-attention, '
-                             'longer = Top-K compressed encoder '
-                             '(only this variant consumes --seq_top_k / --seq_causal)')
-    parser.add_argument('--hidden_mult', type=int, default=4,
-                        help='FFN inner-dim multiplier relative to d_model')
-    parser.add_argument('--embed_dropout_rate', type=float, default=0.01,
-                        help='Dropout rate for input embeddings')
-    parser.add_argument('--seq_id_dropout_rate', type=float, default=0.02,
-                        help='Dropout rate for high-cardinality seq ID features')
-    parser.add_argument('--hidden_dropout_rate', type=float, default=0.01,
-                        help='Dropout rate for hidden layers (encoder/attn/classifier)')
-    parser.add_argument('--norm_type', type=str, default='layer',
-                        choices=['layer', 'rms'],
-                        help='Normalization type: layer = LayerNorm, rms = RMSNorm')
-    parser.add_argument('--seq_top_k', type=int, default=50,
-                        help='Number of most-recent tokens kept by LongerEncoder '
-                             '(only effective when --seq_encoder_type=longer)')
-    parser.add_argument('--seq_causal', action='store_true', default=False,
-                        help='Whether the LongerEncoder self-attention uses a causal mask '
-                             '(only effective when --seq_encoder_type=longer)')
-    parser.add_argument('--action_num', type=int, default=1,
-                        help='Classifier output dimension '
-                             '(1 = single binary-classification logit; >1 = multi-label)')
-    parser.add_argument('--use_time_buckets', action='store_true', default=True,
-                        help='Enable the time-bucket embedding (default on). '
-                             'The actual bucket count is uniquely determined by '
-                             'dataset.BUCKET_BOUNDARIES; this flag is a pure on/off switch.')
-    parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
-                        help='Disable the time-bucket embedding')
-    parser.add_argument('--rank_mixer_mode', type=str, default='full',
-                        choices=['full', 'ffn_only', 'none'],
-                        help='RankMixerBlock mode: '
-                             'full = token mixing + per-token FFN (requires d_model divisible by T), '
-                             'ffn_only = per-token FFN only, '
-                             'none = identity passthrough')
-    parser.add_argument('--use_rope', action='store_true', default=False,
-                        help='Enable RoPE positional encoding in sequence attention')
-    parser.add_argument('--rope_base', type=float, default=10000.0,
-                        help='RoPE base frequency (default 10000)')
+    cli_args = parser.parse_args()
 
-    # Loss function.
-    parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
-                        help='Loss type: bce = BCEWithLogits, focal = Focal Loss')
-    parser.add_argument('--focal_alpha', type=float, default=0.1,
-                        help='Focal Loss positive-class weight alpha '
-                             '(effective only when --loss_type=focal)')
-    parser.add_argument('--focal_gamma', type=float, default=2.0,
-                        help='Focal Loss focusing parameter gamma '
-                             '(effective only when --loss_type=focal)')
+    # 1. Load yaml as base config.
+    with open(cli_args.config) as f:
+        cfg: Dict[str, Any] = yaml.safe_load(f)
+    logging.info(f"Loaded config from {cli_args.config}")
 
-    # Sparse optimizer.
-    parser.add_argument('--sparse_lr', type=float, default=0.05,
-                        help='Learning rate for sparse parameters (Adagrad over Embeddings)')
-    parser.add_argument('--sparse_weight_decay', type=float, default=0.0,
-                        help='Weight decay for sparse parameters (Adagrad over Embeddings)')
-    parser.add_argument('--reinit_sparse_after_epoch', type=int, default=1,
-                        help='Starting from the N-th epoch, at the end of every epoch '
-                             're-initialize Embeddings with vocab_size > '
-                             '--reinit_cardinality_threshold and rebuild the Adagrad '
-                             'optimizer state (cold-restart trick for high-cardinality '
-                             'features to reduce overfitting)')
-    parser.add_argument('--reinit_cardinality_threshold', type=int, default=0,
-                        help='Cardinality threshold used by the re-init strategy: '
-                             'Embeddings whose vocab_size exceeds this value are reset '
-                             'at each epoch end (0 = reset all Embeddings)')
+    # 2. CLI overrides yaml (only non-None values).
+    for key, val in vars(cli_args).items():
+        if key != 'config' and val is not None:
+            cfg[key] = val
 
-    # Embedding construction control.
-    parser.add_argument('--emb_skip_threshold', type=int, default=100, # 0
-                        help='At model construction time, features whose vocab_size '
-                             'exceeds this value get no Embedding and are represented '
-                             'by a zero vector at forward time (0 = no skipping; '
-                             'all features get an Embedding). Useful for saving GPU '
-                             'memory on ultra-high-cardinality features.')
-    parser.add_argument('--seq_id_threshold', type=int, default=100, # 10000
-                        help='Within the sequence tokenizer, features with vocab_size '
-                             'exceeding this value are treated as id features and receive '
-                             'extra dropout(rate*2) during training to reduce overfitting. '
-                             'Features at or below this threshold are treated as side-info '
-                             'and receive no extra dropout.')
+    # 3. Environment variables take precedence.
+    if 'TRAIN_DATA_PATH' in os.environ:
+        cfg['data_dir'] = os.environ['TRAIN_DATA_PATH']
+    if 'TRAIN_CKPT_PATH' in os.environ:
+        cfg['ckpt_dir'] = os.environ['TRAIN_CKPT_PATH']
+    if 'TRAIN_LOG_PATH' in os.environ:
+        cfg['log_dir'] = os.environ['TRAIN_LOG_PATH']
+    cfg['tf_events_dir'] = os.environ.get(
+        'TRAIN_TF_EVENTS_PATH',
+        os.path.join(cfg.get('log_dir', 'output'), 'tf_events'))
 
-    _default_ns_groups = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), 'ns_groups.json')
-    parser.add_argument('--ns_groups_json', type=str, default=_default_ns_groups,
-                        help='Path to the NS-groups JSON file. If it does not exist, '
-                             'each feature is placed in its own singleton group.')
+    # Device: if not set anywhere, auto-detect.
+    if 'device' not in cfg or cfg['device'] is None:
+        cfg['device'] = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # NS tokenizer variant.
-    parser.add_argument('--ns_tokenizer_type', type=str, default='rankmixer',
-                        choices=['group', 'rankmixer'],
-                        help='NS tokenizer variant: '
-                             'group = project each group to one token, '
-                             'rankmixer = concatenate all embeddings then split into '
-                             'equal-size chunks (token count is tunable)')
-    parser.add_argument('--user_ns_tokens', type=int, default=0,
-                        help='Number of user NS tokens in rankmixer mode '
-                             '(0 = automatically use the number of user groups)')
-    parser.add_argument('--item_ns_tokens', type=int, default=0,
-                        help='Number of item NS tokens in rankmixer mode '
-                             '(0 = automatically use the number of item groups)')
-
-    args = parser.parse_args()
-
-    # Environment variables take precedence.
-    args.data_dir = os.environ.get('TRAIN_DATA_PATH', args.data_dir)
-    args.ckpt_dir = os.environ.get('TRAIN_CKPT_PATH', args.ckpt_dir)
-    args.log_dir = os.environ.get('TRAIN_LOG_PATH', args.log_dir)
-    args.tf_events_dir = os.environ.get('TRAIN_TF_EVENTS_PATH', os.path.join(args.log_dir, 'tf_events'))
-
-    return args
+    return cfg
 
 
 def main() -> None:
-    args = parse_args()
+    cfg = parse_args_and_config()
 
     # Create output directories.
-    Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
-    Path(args.log_dir).mkdir(parents=True, exist_ok=True)
-    Path(args.tf_events_dir).mkdir(parents=True, exist_ok=True)
+    Path(cfg['ckpt_dir']).mkdir(parents=True, exist_ok=True)
+    Path(cfg['log_dir']).mkdir(parents=True, exist_ok=True)
+    Path(cfg['tf_events_dir']).mkdir(parents=True, exist_ok=True)
 
     # Initialize logger and RNG.
-    set_seed(args.seed)
-    create_logger(os.path.join(args.log_dir, 'train.log'))
-    logging.info(f"Args: {vars(args)}")
+    set_seed(cfg['seed'])
+    create_logger(os.path.join(cfg['log_dir'], 'train.log'))
+    logging.info(f"Config: {cfg}")
 
     from torch.utils.tensorboard import SummaryWriter
-    writer = SummaryWriter(args.tf_events_dir)
+    writer = SummaryWriter(cfg['tf_events_dir'])
 
     # ---- Data loading ----
-    if args.schema_path:
-        schema_path = args.schema_path
+    if cfg.get('schema_path'):
+        schema_path = cfg['schema_path']
     else:
-        schema_path = os.path.join(args.data_dir, 'schema.json')
+        schema_path = os.path.join(cfg['data_dir'], 'schema.json')
 
     if not os.path.exists(schema_path):
         raise FileNotFoundError(f"schema file not found at {schema_path}")
 
     # Parse per-domain sequence-length overrides.
     seq_max_lens = {}
-    if args.seq_max_lens:
-        for pair in args.seq_max_lens.split(','):
+    sml = cfg.get('seq_max_lens', '')
+    if sml:
+        for pair in sml.split(','):
             k, v = pair.split(':')
             seq_max_lens[k.strip()] = int(v.strip())
         logging.info(f"Seq max_lens override: {seq_max_lens}")
 
     logging.info("Using Parquet data format (IterableDataset)")
     train_loader, valid_loader, pcvr_dataset = get_pcvr_data(
-        data_dir=args.data_dir,
+        data_dir=cfg['data_dir'],
         schema_path=schema_path,
-        batch_size=args.batch_size,
-        valid_ratio=args.valid_ratio,
-        train_ratio=args.train_ratio,
-        num_workers=args.num_workers,
-        buffer_batches=args.buffer_batches,
-        seed=args.seed,
+        batch_size=cfg['batch_size'],
+        valid_ratio=cfg.get('valid_ratio', 0.1),
+        train_ratio=cfg.get('train_ratio', 1.0),
+        num_workers=cfg.get('num_workers', 16),
+        buffer_batches=cfg.get('buffer_batches', 20),
+        seed=cfg['seed'],
         seq_max_lens=seq_max_lens,
+        valid_data_dir=cfg.get('valid_data_dir'),
+        add_seq_time_attrs=cfg.get('add_seq_time_attrs', True),
     )
 
     # ---- NS groups ----
-    if args.ns_groups_json and os.path.exists(args.ns_groups_json):
-        logging.info(f"Loading NS groups from {args.ns_groups_json}")
-        with open(args.ns_groups_json, 'r') as f:
+    ns_groups_json = cfg.get('ns_groups_json', '')
+    if ns_groups_json and os.path.exists(ns_groups_json):
+        logging.info(f"Loading NS groups from {ns_groups_json}")
+        with open(ns_groups_json, 'r') as f:
             ns_groups_cfg = json.load(f)
         user_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.user_int_schema.entries)}
         item_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.item_int_schema.entries)}
@@ -302,6 +175,9 @@ def main() -> None:
         pcvr_dataset.user_int_schema, pcvr_dataset.user_int_vocab_sizes)
     item_int_feature_specs = build_feature_specs(
         pcvr_dataset.item_int_schema, pcvr_dataset.item_int_vocab_sizes)
+    paired_feature_specs = build_feature_specs(
+        pcvr_dataset.paired_int_schema, pcvr_dataset.paired_int_vocab_sizes) if hasattr(pcvr_dataset, 'paired_int_schema') else []
+    paired_fids = [fid for fid, _, _ in pcvr_dataset.paired_int_schema.entries] if hasattr(pcvr_dataset, 'paired_int_schema') else []
 
     model_args = {
         "user_int_feature_specs": user_int_feature_specs,
@@ -311,42 +187,54 @@ def main() -> None:
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,
         "item_ns_groups": item_ns_groups,
-        "d_model": args.d_model,
-        "emb_dim": args.emb_dim,
-        "num_queries": args.num_queries,
-        "num_hyformer_blocks": args.num_hyformer_blocks,
-        "num_heads": args.num_heads,
-        "seq_encoder_type": args.seq_encoder_type,
-        "hidden_mult": args.hidden_mult,
-        "embed_dropout_rate": args.embed_dropout_rate,
-        "seq_id_dropout_rate": args.seq_id_dropout_rate,
-        "hidden_dropout_rate": args.hidden_dropout_rate,
-        "norm_type": args.norm_type,
-        "seq_top_k": args.seq_top_k,
-        "seq_causal": args.seq_causal,
-        "action_num": args.action_num,
-        "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
-        "rank_mixer_mode": args.rank_mixer_mode,
-        "use_rope": args.use_rope,
-        "rope_base": args.rope_base,
-        "emb_skip_threshold": args.emb_skip_threshold,
-        "seq_id_threshold": args.seq_id_threshold,
-        "ns_tokenizer_type": args.ns_tokenizer_type,
-        "user_ns_tokens": args.user_ns_tokens,
-        "item_ns_tokens": args.item_ns_tokens,
-        "dense_dtype": _DTYPE_MAP[args.dense_dtype],
-        "sparse_dtype": _DTYPE_MAP[args.sparse_dtype],
+        "paired_feature_specs": paired_feature_specs,
+        "paired_fids": paired_fids,
+        "d_model": cfg['d_model'],
+        "emb_dim": cfg['emb_dim'],
+        "num_queries": cfg['num_queries'],
+        "num_hyformer_blocks": cfg['num_hyformer_blocks'],
+        "num_heads": cfg['num_heads'],
+        "seq_encoder_type": cfg['seq_encoder_type'],
+        "hidden_mult": cfg['hidden_mult'],
+        "embed_dropout_rate": cfg['embed_dropout_rate'],
+        "seq_id_dropout_rate": cfg['seq_id_dropout_rate'],
+        "hidden_dropout_rate": cfg['hidden_dropout_rate'],
+        "norm_type": cfg['norm_type'],
+        "seq_top_k": cfg['seq_top_k'],
+        "seq_causal": cfg['seq_causal'],
+        "action_num": cfg['action_num'],
+        "num_time_buckets": NUM_TIME_BUCKETS if cfg.get('use_time_buckets', True) else 0,
+        "rank_mixer_mode": cfg['rank_mixer_mode'],
+        "ffn_name": cfg['ffn_name'],
+        "ffn_config": cfg['ffn_config'],
+        "mixer_type": cfg.get('mixer_type', 'rank'),
+        "use_rope": cfg['use_rope'],
+        "rope_base": cfg['rope_base'],
+        "emb_skip_threshold": cfg['emb_skip_threshold'],
+        "seq_id_threshold": cfg['seq_id_threshold'],
+        "ns_tokenizer_type": cfg['ns_tokenizer_type'],
+        "user_ns_tokens": cfg['user_ns_tokens'],
+        "item_ns_tokens": cfg['item_ns_tokens'],
+        "dense_dtype": _DTYPE_MAP[cfg['dense_dtype']],
+        "sparse_dtype": _DTYPE_MAP[cfg['sparse_dtype']],
+        "fourier_seq": cfg['fourier_seq'],
+        "fourier_ns": cfg['fourier_ns'],
+        "use_row_time_ns": cfg['use_row_time_ns'],
+        "use_domain_emb": cfg.get('use_domain_emb', False),
+        "seq_proj_type": cfg['seq_proj_type'],
+        "seq_ffn_name": cfg['seq_ffn_name'],
+        "seq_ffn_config": cfg['seq_ffn_config'],
     }
 
-    logging.info(f"Dtype config: dense={args.dense_dtype}, sparse={args.sparse_dtype}")
+    logging.info(f"Dtype config: dense={cfg['dense_dtype']}, sparse={cfg['sparse_dtype']}")
 
-    model = PCVRHyFormer(**model_args).to(args.device)
+    model = PCVRHyFormer(**model_args).to(cfg['device'])
 
     # Log model sizing info.
     num_sequences = len(pcvr_dataset.seq_domains)
     num_ns = model.num_ns
-    T = args.num_queries * num_sequences + num_ns
-    logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}")
+    T = cfg['num_queries'] * num_sequences + num_ns
+    logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={cfg['d_model']}, rank_mixer_mode={cfg['rank_mixer_mode']}")
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())
@@ -354,42 +242,44 @@ def main() -> None:
 
     # ---- Training ----
     early_stopping = EarlyStopping(
-        checkpoint_path=os.path.join(args.ckpt_dir, "placeholder", "model.pt"),
-        patience=args.patience,
+        checkpoint_path=os.path.join(cfg['ckpt_dir'], "placeholder", "model.pt"),
+        patience=cfg['patience'],
         label='model',
     )
 
     ckpt_params = {
-        "layer": args.num_hyformer_blocks,
-        "head": args.num_heads,
-        "hidden": args.d_model,
+        "layer": cfg['num_hyformer_blocks'],
+        "head": cfg['num_heads'],
+        "hidden": cfg['d_model'],
     }
 
     trainer = PCVRHyFormerRankingTrainer(
         model=model,
         train_loader=train_loader,
         valid_loader=valid_loader,
-        lr=args.lr,
-        num_epochs=args.num_epochs,
-        device=args.device,
-        save_dir=args.ckpt_dir,
+        lr=cfg['lr'],
+        num_epochs=cfg['num_epochs'],
+        device=cfg['device'],
+        save_dir=cfg['ckpt_dir'],
         early_stopping=early_stopping,
-        loss_type=args.loss_type,
-        focal_alpha=args.focal_alpha,
-        focal_gamma=args.focal_gamma,
-        sparse_lr=args.sparse_lr,
-        sparse_weight_decay=args.sparse_weight_decay,
-        reinit_sparse_after_epoch=args.reinit_sparse_after_epoch,
-        reinit_cardinality_threshold=args.reinit_cardinality_threshold,
+        loss_type=cfg['loss_type'],
+        focal_alpha=cfg['focal_alpha'],
+        focal_gamma=cfg['focal_gamma'],
+        focal_weight=cfg.get('focal_weight', 0.0),
+        focal_start_epoch=cfg.get('focal_start_epoch', 0),
+        sparse_lr=cfg['sparse_lr'],
+        sparse_weight_decay=cfg['sparse_weight_decay'],
+        reinit_sparse_after_epoch=cfg['reinit_sparse_after_epoch'],
+        reinit_cardinality_threshold=cfg['reinit_cardinality_threshold'],
         ckpt_params=ckpt_params,
         writer=writer,
         schema_path=schema_path,
-        ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
-        eval_every_n_steps=args.eval_every_n_steps,
-        train_config=vars(args),
-        use_amp=args.use_amp,
-        log_step=args.log_step,
-        accumulation_steps=args.accumulation_steps,
+        ns_groups_path=ns_groups_json if ns_groups_json and os.path.exists(ns_groups_json) else None,
+        eval_every_n_steps=cfg.get('eval_every_n_steps', 0),
+        train_config=cfg,
+        use_amp=cfg['use_amp'],
+        log_step=cfg['log_step'],
+        accumulation_steps=cfg['accumulation_steps'],
     )
 
     trainer.train()

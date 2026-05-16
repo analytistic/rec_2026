@@ -71,6 +71,16 @@ _FALLBACK_MODEL_CFG = {
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
+    'fourier_seq': False,
+    'fourier_ns': False,
+    'use_row_time_ns': True,
+    'ffn_name': 'shared',
+    'ffn_config': {},
+    'seq_proj_type': 'linear',
+    'seq_ffn_name': 'shared',
+    'seq_ffn_config': {},
+    'mixer_type': 'rank',
+    'use_domain_emb': False,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -159,6 +169,7 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
             cfg[key] = _FALLBACK_MODEL_CFG[key]
             logging.warning(
                 f"train_config missing '{key}', using fallback = {cfg[key]}")
+
     return cfg
 
 
@@ -223,6 +234,10 @@ def build_model(
     item_int_feature_specs = build_feature_specs(
         dataset.item_int_schema, dataset.item_int_vocab_sizes)
 
+    paired_feature_specs = build_feature_specs(
+        dataset.paired_int_schema, dataset.paired_int_vocab_sizes) if hasattr(dataset, 'paired_int_schema') else []
+    paired_fids = [fid for fid, _, _ in dataset.paired_int_schema.entries] if hasattr(dataset, 'paired_int_schema') else []
+
     logging.info(f"Building PCVRHyFormer with cfg: {model_cfg}")
     model = PCVRHyFormer(
         user_int_feature_specs=user_int_feature_specs,
@@ -232,6 +247,8 @@ def build_model(
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
         user_ns_groups=user_ns_groups,
         item_ns_groups=item_ns_groups,
+        paired_feature_specs=paired_feature_specs,
+        paired_fids=paired_fids,
         **model_cfg,
     ).to(device)
 
@@ -309,6 +326,8 @@ def _batch_to_model_input(
         item_int_feats=device_batch['item_int_feats'],
         user_dense_feats=device_batch['user_dense_feats'],
         item_dense_feats=device_batch['item_dense_feats'],
+        paired_int_feats=device_batch.get('paired_int_feats'),
+        paired_float_feats=device_batch.get('paired_float_feats'),
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
@@ -349,6 +368,7 @@ def main() -> None:
     batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
     num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
 
+    add_seq_time_attrs = train_config.get('add_seq_time_attrs', True)
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
         schema_path=schema_path,
@@ -357,6 +377,7 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
+        add_seq_time_attrs=add_seq_time_attrs,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
@@ -406,6 +427,8 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
     )
 
+    # ---- Feature distribution analysis (test, full scan) ----
+
     all_probs = []
     all_user_ids = []
     logging.info("Starting inference...")
@@ -415,7 +438,7 @@ def main() -> None:
             model_input = _batch_to_model_input(batch, device)
             user_ids = batch.get('user_id', [])
 
-            logits, _ = model.predict(model_input)
+            logits = model.predict(model_input).logits
             logits = logits.squeeze(-1)
             probs = torch.sigmoid(logits).cpu().numpy()
             all_probs.extend(probs.tolist())

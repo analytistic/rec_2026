@@ -2,10 +2,14 @@
 
 import logging
 import math
+from typing import Dict, List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, NamedTuple, Tuple, Optional, Union
+
+from .paired_float_stats import PAIRED_FLOAT_MAX_BY_INT
 
 
 class MixedNorm(nn.Module):
@@ -40,6 +44,97 @@ class ModelInput(NamedTuple):
     hour: torch.Tensor  # [B], row-level hour of day (1..24)
     dow: torch.Tensor  # [B], row-level day of week (1..7)
     weekend: torch.Tensor  # [B], row-level weekend flag (1=workday, 2=weekend)
+    paired_int_feats: torch.Tensor = None   # (B, total_paired_int_dim), optional
+    paired_float_feats: torch.Tensor = None  # (B, total_paired_float_dim), optional
+
+
+class ModelOutput(NamedTuple):
+    logits: torch.Tensor      # (B, action_num)
+    embeddings: torch.Tensor  # (B, D) final embedding before classifier
+    ns_tokens: torch.Tensor   # (B, num_ns, D) NS token representations
+
+
+class MixerFFNInput(NamedTuple):
+    """Input to MixerFFN — pre-split token groups.
+
+    user_token:  (B, user_token_num, D)  — all user-side NS tokens
+    item_token:  (B, item_token_num, D)  — all item-side NS tokens
+    query_token: dict[str, Tensor] — {domain: (B, Nq, D)} per-domain query tokens
+    """
+    user_token: torch.Tensor
+    item_token: torch.Tensor
+    query_token: Dict[str, torch.Tensor]
+
+
+class MixerFFNOutput(NamedTuple):
+    """Output from MixerFFN — each group independently processed."""
+    user_token: torch.Tensor
+    item_token: torch.Tensor
+    query_token: Dict[str, torch.Tensor]
+
+
+class UIQFFN(nn.Module):
+
+    def __init__(
+        self,
+        d_model: int,
+        hidden_mult: int = 4,
+        dropout: float = 0.0,
+        user_token_num: int = 0,
+        item_token_num: int = 0,
+        query_domains: Optional[List[str]] = None,
+        norm_type: str = 'layer',
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.hidden_dim = d_model * hidden_mult
+        self.query_domains = query_domains or []
+
+        # User & item NS token FFNs
+        self.user_ffn = nn.Sequential(
+            nn.Linear(d_model, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, d_model),
+        )
+        self.item_ffn = nn.Sequential(
+            nn.Linear(d_model, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, d_model),
+        )
+
+        # Shared query token FFN (all domains use the same)
+        self.query_ffn = nn.Sequential(
+            nn.Linear(d_model, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, d_model),
+        )
+
+        self.ffn_norm = MixedNorm(d_model, norm_type)
+
+    def forward(self, x: MixerFFNInput) -> MixerFFNOutput:
+        user_out = self.user_ffn(x.user_token)
+        item_out = self.item_ffn(x.item_token)
+        query_out = {d: self.query_ffn(x.query_token[d]) for d in x.query_token}
+        # Concat outputs + residual from inputs → norm → split back
+        out_parts = ([query_out[d] for d in self.query_domains]
+                     + [user_out, item_out])
+        in_parts = ([x.query_token[d] for d in self.query_domains]
+                    + [x.user_token, x.item_token])
+        flat = self.ffn_norm(torch.cat(out_parts, dim=1) + torch.cat(in_parts, dim=1))
+        offset = 0
+        qo = {}
+        for d in self.query_domains:
+            nq = x.query_token[d].shape[1]
+            qo[d] = flat[:, offset:offset + nq, :]
+            offset += nq
+        un = x.user_token.shape[1]
+        uo = flat[:, offset:offset + un, :]
+        offset += un
+        io = flat[:, offset:, :]
+        return MixerFFNOutput(user_token=uo, item_token=io, query_token=qo)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -381,105 +476,626 @@ class CrossAttention(nn.Module):
         return out
 
 
-class RankMixerBlock(nn.Module):
-    """HyFormer Query Boosting block.
+class RankTokenMixer(nn.Module):
+    """Token mixing from the RankMixer paper with residual + norm.
 
-    Performs three steps:
-    1. Token Mixing: Parameter-free tensor reshaping.
-    2. Per-token FFN: Shared-parameter feedforward network.
-    3. Residual connection: Q_boost = Q + Q_e.
+    Splits d_model into T subspaces, swaps token and subspace dimensions,
+    then residual + layer norm.
+    """
 
-    Constraint: d_model must be divisible by n_total in 'full' mode.
+    def __init__(self, d_model: int, T: int, norm_type: str = 'layer') -> None:
+        super().__init__()
+        assert d_model % T == 0, f"d_model={d_model} must be divisible by T={T}"
+        self.T = T
+        self.d_sub = d_model // T
+        self.norm = MixedNorm(d_model, norm_type)
+
+    def forward(self, Q: torch.Tensor) -> torch.Tensor:
+        B, T, D = Q.shape
+        Q_split = Q.view(B, T, self.T, self.d_sub)
+        Q_rewired = Q_split.transpose(1, 2).contiguous().view(B, T, D)
+        return self.norm(Q_rewired + Q)
+
+
+class GatedRankTokenMixer(nn.Module):
+    """Token mixing with sub-space gating + residual + norm.
+
+    Each output token learns T scalar gates (one per sub-space) to control
+    how much of each sub-space from the rewired token is mixed in.
+    """
+
+    def __init__(self, d_model: int, T: int, norm_type: str = 'layer') -> None:
+        super().__init__()
+        assert d_model % T == 0, f"d_model={d_model} must be divisible by T={T}"
+        self.T = T
+        self.d_sub = d_model // T
+        self.gate_net = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, self.T),
+            nn.Sigmoid(),
+        )
+        self.norm = MixedNorm(d_model, norm_type)
+
+    def forward(self, Q: torch.Tensor) -> torch.Tensor:
+        B, T, D = Q.shape
+
+        Q_split = Q.view(B, T, self.T, self.d_sub)       # (B, T, T, d_sub)
+        Q_rewired_split = Q_split.transpose(1, 2)         # (B, T, T, d_sub)
+
+        gate = self.gate_net(
+            Q_rewired_split.contiguous().view(B, T, D))   # (B, T, T)
+        gate = gate.unsqueeze(-1)                         # (B, T, T, 1)
+
+        Q_mixed    = Q_rewired_split * gate
+        Q_original = Q_split * (1 - gate)
+
+        return self.norm(
+            Q_mixed.reshape(B, T, D) + Q_original.reshape(B, T, D))
+
+
+class PerTokenFFN(nn.Module):
+    """Per-token FFN — independent parameters per token position, with residual + norm.
+
+    Accepts MixerFFNInput, concats groups, applies per-token FCs,
+    adds residual, applies norm, splits back.
+    """
+
+    def __init__(self, d_model: int, hidden_mult: int = 4,
+                 dropout: float = 0.0, num_tokens: int = 0,
+                 query_domains: Optional[List[str]] = None,
+                 norm_type: str = 'layer', **kwargs) -> None:
+        super().__init__()
+        self.num_tokens = num_tokens
+        self.query_domains = query_domains or []
+        hidden_dim = d_model * hidden_mult
+        self.fc1 = nn.ModuleList([
+            nn.Linear(d_model, hidden_dim) for _ in range(num_tokens)
+        ])
+        self.fc2 = nn.ModuleList([
+            nn.Linear(hidden_dim, d_model) for _ in range(num_tokens)
+        ])
+        self.dropout = nn.Dropout(dropout)
+        self.ffn_norm = MixedNorm(d_model, norm_type)
+
+    def forward(self, x: MixerFFNInput) -> MixerFFNOutput:
+        # Concat groups → flat → per-token FCs → residual+norm
+        parts = ([x.query_token[d] for d in self.query_domains]
+                 + [x.user_token, x.item_token])
+        flat = torch.cat(parts, dim=1)
+        outputs = []
+        for t in range(self.num_tokens):
+            xt = flat[:, t:t+1, :]
+            xt = self.fc1[t](xt)
+            xt = F.gelu(xt)
+            xt = self.dropout(xt)
+            xt = self.fc2[t](xt)
+            outputs.append(xt)
+        out = torch.cat(outputs, dim=1)
+        out = self.ffn_norm(out + flat)
+        # Split back by input shapes
+        offset = 0
+        qo = {}
+        for d in self.query_domains:
+            nq = x.query_token[d].shape[1]
+            qo[d] = out[:, offset:offset + nq, :]
+            offset += nq
+        un = x.user_token.shape[1]
+        uo = out[:, offset:offset + un, :]
+        offset += un
+        io = out[:, offset:, :]
+        return MixerFFNOutput(user_token=uo, item_token=io, query_token=qo)
+
+
+class SharedFFN(nn.Module):
+    """Shared FFN — single fc1/fc2 for all tokens, with residual + norm.
+
+    Accepts MixerFFNInput, concats groups internally, processes, adds residual,
+    applies norm, splits back.
+    """
+
+    def __init__(self, d_model: int, hidden_mult: int = 4,
+                 dropout: float = 0.0, query_domains: Optional[List[str]] = None,
+                 norm_type: str = 'layer', **kwargs) -> None:
+        super().__init__()
+        hidden_dim = d_model * hidden_mult
+        self.query_domains = query_domains or []
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+        )
+        self.ffn_norm = MixedNorm(d_model, norm_type)
+
+    def forward(self, x: MixerFFNInput) -> MixerFFNOutput:
+        # Concat groups → flat → process → residual+norm
+        parts = ([x.query_token[d] for d in self.query_domains]
+                 + [x.user_token, x.item_token])
+        flat = torch.cat(parts, dim=1)
+        out = self.net(flat)
+        out = self.ffn_norm(out + flat)
+        # Split back by input shapes
+        offset = 0
+        qo = {}
+        for d in self.query_domains:
+            nq = x.query_token[d].shape[1]
+            qo[d] = out[:, offset:offset + nq, :]
+            offset += nq
+        un = x.user_token.shape[1]
+        uo = out[:, offset:offset + un, :]
+        offset += un
+        io = out[:, offset:, :]
+        return MixerFFNOutput(user_token=uo, item_token=io, query_token=qo)
+
+
+class DenseMoE(nn.Module):
+    """Dense Mixture of Experts with input-dependent routing, residual + norm.
+
+    Accepts MixerFFNInput, concats groups internally, processes, adds residual,
+    applies norm, splits back.
+    """
+
+    def __init__(self, d_model: int, hidden_mult: int = 4,
+                 dropout: float = 0.0, num_experts: int = 16,
+                 query_domains: Optional[List[str]] = None,
+                 norm_type: str = 'layer', **kwargs) -> None:
+        super().__init__()
+        hidden_dim = d_model * hidden_mult
+        self.num_experts = num_experts
+        self.query_domains = query_domains or []
+
+        self.router = nn.Linear(d_model, num_experts)
+        self.W1 = nn.Parameter(torch.empty(num_experts, d_model, hidden_dim))
+        self.b1 = nn.Parameter(torch.empty(num_experts, hidden_dim))
+        self.W2 = nn.Parameter(torch.empty(num_experts, hidden_dim, d_model))
+        self.b2 = nn.Parameter(torch.empty(num_experts, d_model))
+        self.dropout = nn.Dropout(dropout)
+        self.ffn_norm = MixedNorm(d_model, norm_type)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_normal_(self.W1)
+        nn.init.xavier_normal_(self.W2)
+        nn.init.zeros_(self.b1)
+        nn.init.zeros_(self.b2)
+
+    def _apply_moe(self, x: torch.Tensor) -> torch.Tensor:
+        """Flat dense MoE forward: (B, T, D) → (B, T, D)."""
+        weights = F.softmax(self.router(x), dim=-1)
+        h = torch.einsum('btd,ndk->btnk', x, self.W1) + self.b1
+        h = F.gelu(h)
+        h = self.dropout(h)
+        h = torch.einsum('btnk,nkd->btnd', h, self.W2) + self.b2
+        return torch.einsum('btn,btnd->btd', weights, h)
+
+    def forward(self, x: MixerFFNInput) -> MixerFFNOutput:
+        parts = ([x.query_token[d] for d in self.query_domains]
+                 + [x.user_token, x.item_token])
+        flat = torch.cat(parts, dim=1)
+        out = self.ffn_norm(self._apply_moe(flat) + flat)
+        offset = 0
+        qo = {}
+        for d in self.query_domains:
+            nq = x.query_token[d].shape[1]
+            qo[d] = out[:, offset:offset + nq, :]
+            offset += nq
+        un = x.user_token.shape[1]
+        uo = out[:, offset:offset + un, :]
+        offset += un
+        io = out[:, offset:, :]
+        return MixerFFNOutput(user_token=uo, item_token=io, query_token=qo)
+
+
+class DenseProtoMoE(nn.Module):
+    """Dense MoE with static per-token expert routing, residual + norm.
+
+    Each NS token position learns a fixed set of expert scores (not
+    input-dependent). The routing is purely position-based: each token
+    slot gets a consistent mixture of experts.
+    """
+
+    def __init__(self, d_model: int, hidden_mult: int = 4,
+                 dropout: float = 0.0, num_experts: int = 16,
+                 query_domains: Optional[List[str]] = None,
+                 num_ns_tokens: int = 0, norm_type: str = 'layer',
+                 **kwargs) -> None:
+        super().__init__()
+        hidden_dim = d_model * hidden_mult
+        self.num_experts = num_experts
+        self.query_domains = query_domains or []
+
+        # Static per-token routing scores (no input dependence)
+        self.ns_token_route = nn.Parameter(torch.empty(num_ns_tokens, num_experts))
+
+        self.W1 = nn.Parameter(torch.empty(num_experts, d_model, hidden_dim))
+        self.b1 = nn.Parameter(torch.empty(num_experts, hidden_dim))
+        self.W2 = nn.Parameter(torch.empty(num_experts, hidden_dim, d_model))
+        self.b2 = nn.Parameter(torch.empty(num_experts, d_model))
+        self.dropout = nn.Dropout(dropout)
+        self.ffn_norm = MixedNorm(d_model, norm_type)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_normal_(self.W1)
+        nn.init.xavier_normal_(self.W2)
+        nn.init.xavier_normal_(self.ns_token_route)
+        nn.init.zeros_(self.b1)
+        nn.init.zeros_(self.b2)
+
+    def _apply_moe(self, x: torch.Tensor) -> torch.Tensor:
+        """Flat dense MoE forward: (B, T, D) → (B, T, D)."""
+        B, T, _ = x.shape
+        weights = F.softmax(self.ns_token_route[:T].unsqueeze(0).expand(B, -1, -1), dim=-1)
+
+        h = torch.einsum('btd,ndk->btnk', x, self.W1) + self.b1
+        h = F.gelu(h)
+        h = self.dropout(h)
+        h = torch.einsum('btnk,nkd->btnd', h, self.W2) + self.b2
+        return torch.einsum('btn,btnd->btd', weights, h)
+
+    def forward(self, x: MixerFFNInput) -> MixerFFNOutput:
+        parts = ([x.query_token[d] for d in self.query_domains]
+                 + [x.user_token, x.item_token])
+        flat = torch.cat(parts, dim=1)
+        out = self.ffn_norm(self._apply_moe(flat) + flat)
+        offset = 0
+        qo = {}
+        for d in self.query_domains:
+            nq = x.query_token[d].shape[1]
+            qo[d] = out[:, offset:offset + nq, :]
+            offset += nq
+        un = x.user_token.shape[1]
+        uo = out[:, offset:offset + un, :]
+        offset += un
+        io = out[:, offset:, :]
+        return MixerFFNOutput(user_token=uo, item_token=io, query_token=qo)
+
+
+class SparseMoELossFree(nn.Module):
+    """Top-K sparse MoE with loss-free load balancing (DeepSeek-style).
+
+    Routed experts use sigmoid gating + bias-on-scores (paper Algorithm 1).
+    Optionally includes shared experts (always activated, summed directly).
+
+    All N routed experts are computed densely (einsum) for N ≤ 8 — GPU
+    utilization beats sparse execution. The top-K outputs are gathered per
+    token and weighted by bias-free sigmoid scores.
     """
 
     def __init__(
         self,
         d_model: int,
-        n_total: int,  # T = Nq + Nns
+        hidden_mult: int = 4,
+        num_experts: int = 4,
+        top_k: int = 1,
+        dropout: float = 0.0,
+        bias_lr: float = 1e-3,
+        num_shared_experts: int = 0,
+        query_domains: Optional[List[str]] = None,
+        norm_type: str = 'layer',
+    ) -> None:
+        super().__init__()
+        hidden_dim = d_model * hidden_mult
+        self.num_experts = num_experts
+        self.top_k = min(top_k, num_experts)
+        self.bias_lr = bias_lr
+        self.num_shared = num_shared_experts
+        self.query_domains = query_domains or []
+
+        self.router = nn.Linear(d_model, num_experts)
+        self.expert_bias = nn.Parameter(torch.zeros(num_experts), requires_grad=False)
+
+        # Routed experts
+        self.W1 = nn.Parameter(torch.empty(num_experts, d_model, hidden_dim))
+        self.b1 = nn.Parameter(torch.empty(num_experts, hidden_dim))
+        self.W2 = nn.Parameter(torch.empty(num_experts, hidden_dim, d_model))
+        self.b2 = nn.Parameter(torch.empty(num_experts, d_model))
+
+        # Shared experts (always activated, summed directly, no gating)
+        if num_shared_experts > 0:
+            self.shared_W1 = nn.Parameter(
+                torch.empty(num_shared_experts, d_model, hidden_dim))
+            self.shared_b1 = nn.Parameter(
+                torch.empty(num_shared_experts, hidden_dim))
+            self.shared_W2 = nn.Parameter(
+                torch.empty(num_shared_experts, hidden_dim, d_model))
+            self.shared_b2 = nn.Parameter(
+                torch.empty(num_shared_experts, d_model))
+        else:
+            self.shared_W1 = None
+
+        self.dropout = nn.Dropout(dropout)
+        self.ffn_norm = MixedNorm(d_model, norm_type)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_normal_(self.W1)
+        nn.init.xavier_normal_(self.W2)
+        nn.init.zeros_(self.b1)
+        nn.init.zeros_(self.b2)
+        if self.shared_W1 is not None:
+            nn.init.xavier_normal_(self.shared_W1)
+            nn.init.xavier_normal_(self.shared_W2)
+            nn.init.zeros_(self.shared_b1)
+            nn.init.zeros_(self.shared_b2)
+
+    def _forward_flat(self, x: torch.Tensor) -> torch.Tensor:
+        """Flat forward: (B, T, D) → (B, T, D)."""
+        B, T, D = x.shape
+        N = self.num_experts
+        K = self.top_k
+
+        # Shared experts
+        if self.shared_W1 is not None:
+            S = self.num_shared
+            h_s = torch.einsum('btd,sdk->btsk', x, self.shared_W1) + self.shared_b1
+            h_s = F.gelu(h_s)
+            h_s = self.dropout(h_s)
+            h_s = torch.einsum('btsk,skd->btsd', h_s, self.shared_W2) + self.shared_b2
+            shared_out = h_s.sum(dim=2)
+        else:
+            shared_out = 0
+
+        # Routed experts
+        router_scores = torch.sigmoid(self.router(x))
+        biased_scores = router_scores + self.expert_bias
+        _, expert_idx = biased_scores.topk(K, dim=-1)
+        gating = router_scores.gather(dim=-1, index=expert_idx)
+
+        h = torch.einsum('btd,ndk->btnk', x, self.W1) + self.b1
+        h = F.gelu(h)
+        h = self.dropout(h)
+        h = torch.einsum('btnk,nkd->btnd', h, self.W2) + self.b2
+
+        idx_expanded = expert_idx.unsqueeze(-1).expand(-1, -1, -1, D)
+        expert_outputs = h.gather(dim=2, index=idx_expanded)
+        routed_out = (expert_outputs * gating.unsqueeze(-1)).sum(dim=2)
+
+        if self.training:
+            with torch.no_grad():
+                total_selections = B * T * K
+                target_load = total_selections / N
+                load = F.one_hot(expert_idx, N).sum(dim=(0, 1, 2)).to(router_scores.dtype)
+                error = target_load - load
+                self.expert_bias.add_(self.bias_lr * error.sign())
+
+        return shared_out + routed_out
+
+    def forward(self, x: MixerFFNInput) -> MixerFFNOutput:
+        parts = ([x.query_token[d] for d in self.query_domains]
+                 + [x.user_token, x.item_token])
+        flat = torch.cat(parts, dim=1)
+        out = self.ffn_norm(self._forward_flat(flat) + flat)
+        offset = 0
+        qo = {}
+        for d in self.query_domains:
+            nq = x.query_token[d].shape[1]
+            qo[d] = out[:, offset:offset + nq, :]
+            offset += nq
+        un = x.user_token.shape[1]
+        uo = out[:, offset:offset + un, :]
+        offset += un
+        io = out[:, offset:, :]
+        return MixerFFNOutput(user_token=uo, item_token=io, query_token=qo)
+
+
+class MTmixAttMoE(nn.Module):
+    """MTmixAtt-style Shared Dense MoE (Meituan 2025).
+
+    Three key differences from standard MoE:
+      1. Sigmoid gating (not softmax) — each expert gets an independent 0-1 gate.
+      2. Dense activation — ALL experts activated per token (no top-K).
+      3. Fine-grained splitting — each base expert split into *m* smaller
+         sub-experts, total FLOPs unchanged.
+
+    Formula (Eq.11-12):
+        h_t = Σ α_i · FFN_i(u_t) + Σ β_j · FFN_j(u_t)
+              ↑ shared (Ks)         ↑ fine-grained (m×N)
+              sigmoid gate          sigmoid gate
+
+    Fine-grained split:
+        Original:   N experts,  each hidden_dim = d_model × hidden_mult
+        Split:      m×N experts, each hidden_dim = d_model × hidden_mult / m
+        Total FLOPs: N × (d × h) = m×N × (d × h/m)
+    """
+
+    def __init__(
+        self,
+        d_model: int,
         hidden_mult: int = 4,
         dropout: float = 0.0,
-        mode: str = 'full',  # 'full' | 'ffn_only' | 'none'
+        num_experts: int = 4,           # N: base experts
+        num_shared_experts: int = 2,    # Ks: shared experts
+        num_fine_grained: int = 2,      # m: split factor
+        query_domains: Optional[List[str]] = None,
         norm_type: str = 'layer',
+    ) -> None:
+        super().__init__()
+        hidden_dim = d_model * hidden_mult
+        fine_hidden = hidden_dim // num_fine_grained
+        num_fine = num_experts * num_fine_grained   # M = m × N
+        self.query_domains = query_domains or []
+
+        # Fine-grained experts: sigmoid gate + dense einsum
+        self.fine_gate = nn.Linear(d_model, num_fine)
+        self.fine_W1 = nn.Parameter(torch.empty(num_fine, d_model, fine_hidden))
+        self.fine_b1 = nn.Parameter(torch.empty(num_fine, fine_hidden))
+        self.fine_W2 = nn.Parameter(torch.empty(num_fine, fine_hidden, d_model))
+        self.fine_b2 = nn.Parameter(torch.empty(num_fine, d_model))
+
+        # Shared experts
+        self.num_shared = num_shared_experts
+        if num_shared_experts > 0:
+            self.shared_gate = nn.Linear(d_model, num_shared_experts)
+            self.shared_W1 = nn.Parameter(
+                torch.empty(num_shared_experts, d_model, hidden_dim))
+            self.shared_b1 = nn.Parameter(
+                torch.empty(num_shared_experts, hidden_dim))
+            self.shared_W2 = nn.Parameter(
+                torch.empty(num_shared_experts, hidden_dim, d_model))
+            self.shared_b2 = nn.Parameter(
+                torch.empty(num_shared_experts, d_model))
+        else:
+            self.shared_gate = None
+            self.shared_W1 = None
+
+        self.dropout = nn.Dropout(dropout)
+        self.ffn_norm = MixedNorm(d_model, norm_type)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_normal_(self.fine_W1)
+        nn.init.xavier_normal_(self.fine_W2)
+        nn.init.zeros_(self.fine_b1)
+        nn.init.zeros_(self.fine_b2)
+        if self.shared_W1 is not None:
+            nn.init.xavier_normal_(self.shared_W1)
+            nn.init.xavier_normal_(self.shared_W2)
+            nn.init.zeros_(self.shared_b1)
+            nn.init.zeros_(self.shared_b2)
+
+    def _forward_flat(self, x: torch.Tensor) -> torch.Tensor:
+        """Flat forward: (B, T, D) → (B, T, D)."""
+        B, T, D = x.shape
+        fine_gates = torch.sigmoid(self.fine_gate(x))
+        h = torch.einsum('btd,mdk->btmk', x, self.fine_W1) + self.fine_b1
+        h = F.gelu(h)
+        h = self.dropout(h)
+        h = torch.einsum('btmk,mkd->btmd', h, self.fine_W2) + self.fine_b2
+        out = (h * fine_gates.unsqueeze(-1)).sum(dim=2)
+
+        if self.shared_W1 is not None:
+            shared_gates = torch.sigmoid(self.shared_gate(x))
+            h_s = torch.einsum('btd,sdk->btsk', x, self.shared_W1) + self.shared_b1
+            h_s = F.gelu(h_s)
+            h_s = self.dropout(h_s)
+            h_s = torch.einsum('btsk,skd->btsd', h_s, self.shared_W2) + self.shared_b2
+            out = out + (h_s * shared_gates.unsqueeze(-1)).sum(dim=2)
+
+        return out
+
+    def forward(self, x: MixerFFNInput) -> MixerFFNOutput:
+        parts = ([x.query_token[d] for d in self.query_domains]
+                 + [x.user_token, x.item_token])
+        flat = torch.cat(parts, dim=1)
+        out = self.ffn_norm(self._forward_flat(flat) + flat)
+        offset = 0
+        qo = {}
+        for d in self.query_domains:
+            nq = x.query_token[d].shape[1]
+            qo[d] = out[:, offset:offset + nq, :]
+            offset += nq
+        un = x.user_token.shape[1]
+        uo = out[:, offset:offset + un, :]
+        offset += un
+        io = out[:, offset:, :]
+        return MixerFFNOutput(user_token=uo, item_token=io, query_token=qo)
+
+
+class RankMixerBlockV2(nn.Module):
+    """Unified RankMixer query boosting block.
+
+    Token mixing → split → FFN (residual + norm inside each FFN).
+    Returns MixerFFNOutput(query_token, user_token, item_token).
+    """
+
+    FFN_REGISTRY = {
+        'shared': SharedFFN,
+        'per_token': PerTokenFFN,
+        'densemoe': DenseMoE,
+        'densemoe_proto': DenseProtoMoE,
+        'sparsemoe_lf': SparseMoELossFree,
+        'mtmixatt_moe': MTmixAttMoE,
+        'uiq': UIQFFN,
+    }
+
+    MIXER_REGISTRY = {
+        'rank': RankTokenMixer,
+        'gated': GatedRankTokenMixer,
+    }
+
+    def __init__(
+        self,
+        d_model: int,
+        n_total: int,
+        hidden_mult: int = 4,
+        dropout: float = 0.0,
+        mode: str = 'full',
+        norm_type: str = 'layer',
+        ffn_name: str = 'shared',
+        ffn_config: dict = {},
+        mixer_type: str = 'rank',
+        # Group boundaries for MixerFFNInput split/merge
+        user_token_num: int = 0,
+        item_token_num: int = 0,
+        query_domains: Optional[List[str]] = None,
+        num_queries: int = 0,
     ) -> None:
         super().__init__()
         self.T = n_total
         self.D = d_model
         self.mode = mode
+        self.ffn_name = ffn_name
+        self.user_token_num = user_token_num
+        self.item_token_num = item_token_num
+        self.query_domains = query_domains or []
+        self.num_queries = num_queries
 
         if mode == 'none':
-            # Pure identity mapping, no submodules created
             return
 
         if mode == 'full':
             if d_model % n_total != 0:
                 raise ValueError(
-                    f"d_model={d_model} must be divisible by T={n_total} for token mixing."
+                    f"d_model={d_model} must be divisible by T={n_total}"
                 )
-            self.d_sub = d_model // n_total
+            if mixer_type not in self.MIXER_REGISTRY:
+                raise ValueError(f"Unknown mixer_type: {mixer_type!r}, "
+                                 f"available: {list(self.MIXER_REGISTRY.keys())}")
+            mixer_cls = self.MIXER_REGISTRY[mixer_type]
+            self.token_mixer = mixer_cls(d_model, n_total, norm_type=norm_type)
 
-        # Per-token FFN (shared parameters) — used by both 'full' and 'ffn_only'
-        self.norm = MixedNorm(d_model, norm_type)
-        self.fc1 = nn.Linear(d_model, d_model * hidden_mult)
-        self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
-        self.dropout = nn.Dropout(dropout)
-        # Post-LN after residual to stabilize stacked block outputs
-        self.post_norm = MixedNorm(d_model, norm_type)
+        # FFN registry lookup — all variants receive query_domains
+        if ffn_name not in self.FFN_REGISTRY:
+            raise ValueError(f"Unknown ffn_name: {ffn_name!r}, "
+                             f"available: {list(self.FFN_REGISTRY.keys())}")
+        ffn_cls = self.FFN_REGISTRY[ffn_name]
+        total_ns_tokens = num_queries * len(self.query_domains) + user_token_num + item_token_num
+        ffn_kwargs = {**ffn_config, 'query_domains': self.query_domains,
+                      'norm_type': norm_type}
+        if ffn_name == 'per_token':
+            ffn_kwargs.setdefault('num_tokens', n_total)
+        if ffn_name == 'densemoe_proto':
+            ffn_kwargs.setdefault('num_ns_tokens', total_ns_tokens)
+        self.ffn = ffn_cls(d_model=d_model, hidden_mult=hidden_mult,
+                           dropout=dropout, **ffn_kwargs)
 
-    def token_mixing(self, Q: torch.Tensor) -> torch.Tensor:
-        """Performs parameter-free token mixing via reshape and transpose.
+    def _split_into_groups(self, x: torch.Tensor) -> MixerFFNInput:
+        """Split flat (B, T, D) into MixerFFNInput by group boundaries.
 
-        Steps:
-        1. Splits channels into T subspaces: (B, T, D) -> (B, T, T, d_sub).
-        2. Swaps token and subspace axes: (B, token, h, d_sub) -> (B, h, token, d_sub).
-        3. Flattens back: (B, T, D).
-
-        Args:
-            Q: (B, T, D)
-
-        Returns:
-            Mixed tensor of shape (B, T, D).
+        Flat order: [queries (per-domain), user_tokens, item_tokens].
         """
-        B, T, D = Q.shape
+        offset = 0
+        query_token = {}
+        for domain in self.query_domains:
+            query_token[domain] = x[:, offset:offset + self.num_queries, :]
+            offset += self.num_queries
+        user_token = x[:, offset:offset + self.user_token_num, :]
+        offset += self.user_token_num
+        item_token = x[:, offset:, :]
+        return MixerFFNInput(user_token=user_token, item_token=item_token,
+                             query_token=query_token)
 
-        # (B, T, D) -> (B, T, T, d_sub)
-        Q_split = Q.view(B, T, self.T, self.d_sub)
-
-        # (B, token, h, d_sub) -> (B, h, token, d_sub)
-        Q_rewired = Q_split.transpose(1, 2).contiguous()
-
-        # (B, T, T, d_sub) -> (B, T, D)
-        Q_hat = Q_rewired.view(B, T, D)
-        return Q_hat
-
-    def forward(self, Q: torch.Tensor) -> torch.Tensor:
-        """Applies query boosting: token mixing, FFN, and residual connection.
-
-        Args:
-            Q: (B, T, D) where T = Nq + Nns.
-
-        Returns:
-            Boosted tensor of shape (B, T, D).
-        """
+    def forward(self, Q: torch.Tensor) -> MixerFFNOutput:
+        """Token mixing → split → FFN (residual+norm inside) → MixerFFNOutput."""
         if self.mode == 'none':
-            return Q
+            return self._split_into_groups(Q)
 
-        # Token Mixing (parameter-free rewire) or identity
-        if self.mode == 'full':
-            Q_hat = self.token_mixing(Q)
-        else:  # 'ffn_only'
-            Q_hat = Q
+        S = self.token_mixer(Q) if self.mode == 'full' else Q
 
-        # Per-token FFN
-        x = self.norm(Q_hat)
-        x = self.fc1(x)
-        x = F.gelu(x)
-        x = self.dropout(x)
-        Q_e = self.fc2(x)
-
-        # Residual from original Q
-        Q_boost = Q + Q_e
-        Q_boost = self.post_norm(Q_boost)
-        return Q_boost
+        mixer_input = self._split_into_groups(S)
+        return self.ffn(mixer_input)
 
 
 class MultiSeqQueryGenerator(nn.Module):
@@ -613,11 +1229,79 @@ class SwiGLUEncoder(nn.Module):
         return x, key_padding_mask
 
 
+class SeqSharedFFN(nn.Module):
+    """Shared FFN for sequence encoder, Pre-LN norm → net → residual inside.
+
+    Input/output: flat (B, L, D).
+    """
+
+    def __init__(self, d_model: int, hidden_mult: int = 4,
+                 dropout: float = 0.0, norm_type: str = 'layer',
+                 **kwargs) -> None:
+        super().__init__()
+        hidden_dim = d_model * hidden_mult
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+        )
+        self.ffn_norm = MixedNorm(d_model, norm_type)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(self.ffn_norm(x)) + x
+
+
+class SeqDenseMoE(nn.Module):
+    """Dense MoE for sequence encoder, Pre-LN norm → moe → residual inside.
+
+    Input/output: flat (B, L, D).
+    """
+
+    def __init__(self, d_model: int, hidden_mult: int = 4,
+                 dropout: float = 0.0, num_experts: int = 16,
+                 norm_type: str = 'layer', **kwargs) -> None:
+        super().__init__()
+        hidden_dim = d_model * hidden_mult
+        self.num_experts = num_experts
+
+        self.router = nn.Linear(d_model, num_experts)
+        self.W1 = nn.Parameter(torch.empty(num_experts, d_model, hidden_dim))
+        self.b1 = nn.Parameter(torch.empty(num_experts, hidden_dim))
+        self.W2 = nn.Parameter(torch.empty(num_experts, hidden_dim, d_model))
+        self.b2 = nn.Parameter(torch.empty(num_experts, d_model))
+        self.dropout = nn.Dropout(dropout)
+        self.ffn_norm = MixedNorm(d_model, norm_type)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_normal_(self.W1)
+        nn.init.xavier_normal_(self.W2)
+        nn.init.zeros_(self.b1)
+        nn.init.zeros_(self.b2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        inp = self.ffn_norm(x)
+        weights = F.softmax(self.router(inp), dim=-1)
+        h = torch.einsum('btd,ndk->btnk', inp, self.W1) + self.b1
+        h = F.gelu(h)
+        h = self.dropout(h)
+        h = torch.einsum('btnk,nkd->btnd', h, self.W2) + self.b2
+        return torch.einsum('btn,btnd->btd', weights, h) + x
+
+
 class TransformerEncoder(nn.Module):
     """High-capacity sequence encoder with self-attention and RoPE.
 
     Structure: Standard Transformer Encoder Layer (Pre-LN).
+    FFN can be either a standard shared FFN or a Dense MoE variant.
     """
+
+    FFN_REGISTRY = {
+        'shared': SeqSharedFFN,
+        'densemoe': SeqDenseMoE,
+    }
 
     def __init__(
         self,
@@ -626,10 +1310,11 @@ class TransformerEncoder(nn.Module):
         hidden_mult: int = 4,
         dropout: float = 0.0,
         norm_type: str = 'layer',
+        ffn_name: str = 'shared',
+        ffn_config: dict = {},
     ) -> None:
         super().__init__()
         self.norm1 = MixedNorm(d_model, norm_type)
-        self.norm2 = MixedNorm(d_model, norm_type)
 
         self.self_attn = RoPEMultiheadAttention(
             d_model=d_model,
@@ -638,13 +1323,18 @@ class TransformerEncoder(nn.Module):
             rope_on_q=True,
         )
 
-        hidden_dim = d_model * hidden_mult
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, d_model),
-            nn.Dropout(dropout)
+        if ffn_name not in self.FFN_REGISTRY:
+            raise ValueError(f"Unknown ffn_name: {ffn_name!r}, "
+                             f"available: {list(self.FFN_REGISTRY.keys())}")
+
+        ffn_cls = self.FFN_REGISTRY[ffn_name]
+        ffn_kwargs = {**ffn_config, 'query_domains': [],
+                      'norm_type': norm_type}
+        self.ffn = ffn_cls(
+            d_model=d_model,
+            hidden_mult=hidden_mult,
+            dropout=dropout,
+            **ffn_kwargs,
         )
 
     def forward(
@@ -678,11 +1368,8 @@ class TransformerEncoder(nn.Module):
         )
         x = residual + x
 
-        # FFN (Pre-LN)
-        residual = x
-        x = self.norm2(x)
+        # FFN (Pre-LN inside SeqSharedFFN / SeqDenseMoE)
         x = self.ffn(x)
-        x = residual + x
 
         return x, key_padding_mask
 
@@ -891,6 +1578,8 @@ def create_sequence_encoder(
     top_k: int = 50,
     causal: bool = False,
     norm_type: str = 'layer',
+    ffn_name: str = 'shared',
+    ffn_config: dict = {},
 ) -> nn.Module:
     """Creates a sequence encoder of the specified type.
 
@@ -904,6 +1593,8 @@ def create_sequence_encoder(
         causal: Whether to use causal mask in LongerEncoder (only used by
             longer).
         norm_type: Normalization type ('layer' or 'rms').
+        ffn_name: FFN variant name (only used by transformer).
+        ffn_config: Extra kwargs for the FFN variant.
 
     Returns:
         A sequence encoder module.
@@ -911,7 +1602,9 @@ def create_sequence_encoder(
     if encoder_type == 'swiglu':
         return SwiGLUEncoder(d_model, hidden_mult, dropout, norm_type=norm_type)
     elif encoder_type == 'transformer':
-        return TransformerEncoder(d_model, num_heads, hidden_mult, dropout, norm_type=norm_type)
+        return TransformerEncoder(d_model, num_heads, hidden_mult, dropout,
+                                  norm_type=norm_type, ffn_name=ffn_name,
+                                  ffn_config=ffn_config)
     elif encoder_type == 'longer':
         return LongerEncoder(d_model, num_heads, top_k, hidden_mult, dropout, causal, norm_type=norm_type)
     else:
@@ -945,11 +1638,22 @@ class MultiSeqHyFormerBlock(nn.Module):
         causal: bool = False,
         rank_mixer_mode: str = 'full',
         norm_type: str = 'layer',
+        # FFN variants (separate for seq encoder vs RankMixer)
+        ffn_name: str = 'shared',
+        ffn_config: dict = {},
+        mixer_type: str = 'rank',
+        seq_ffn_name: str = 'shared',
+        seq_ffn_config: dict = {},
+        # Group info for MixerFFNInput split/merge
+        user_token_num: int = 0,
+        item_token_num: int = 0,
+        seq_domains: Optional[List[str]] = None,
     ) -> None:
         super().__init__()
         self.num_sequences = num_sequences
         self.num_queries = num_queries
         self.num_ns = num_ns
+        self.seq_domains = seq_domains or []
 
         # Independent sequence encoder per sequence
         self.seq_encoders = nn.ModuleList([
@@ -962,6 +1666,8 @@ class MultiSeqHyFormerBlock(nn.Module):
                 top_k=top_k,
                 causal=causal,
                 norm_type=norm_type,
+                ffn_name=seq_ffn_name,
+                ffn_config=seq_ffn_config,
             )
             for _ in range(num_sequences)
         ])
@@ -980,13 +1686,20 @@ class MultiSeqHyFormerBlock(nn.Module):
 
         # RankMixer: input token count = Nq * S + Nns
         n_total = num_queries * num_sequences + num_ns
-        self.mixer = RankMixerBlock(
+        self.mixer = RankMixerBlockV2(
             d_model=d_model,
             n_total=n_total,
             hidden_mult=hidden_mult,
             dropout=dropout,
             mode=rank_mixer_mode,
             norm_type=norm_type,
+            ffn_name=ffn_name,
+            ffn_config=ffn_config,
+            mixer_type=mixer_type,
+            user_token_num=user_token_num,
+            item_token_num=item_token_num,
+            query_domains=seq_domains,
+            num_queries=num_queries,
         )
 
     def forward(
@@ -1046,16 +1759,12 @@ class MultiSeqHyFormerBlock(nn.Module):
         # 3. Token Fusion: concatenate all decoded_q + ns_tokens
         combined = torch.cat(decoded_qs + [ns_tokens], dim=1)  # (B, Nq*S + Nns, D)
 
-        # 4. Query Boosting
-        boosted = self.mixer(combined)  # (B, Nq*S + Nns, D)
+        # 4. Query Boosting (returns MixerFFNOutput with residual+norm applied)
+        mixer_out = self.mixer(combined)
 
-        # 5. Split back into per-sequence Q and NS
-        next_q_list = []
-        offset = 0
-        for i in range(S):
-            next_q_list.append(boosted[:, offset:offset + Nq, :])
-            offset += Nq
-        next_ns = boosted[:, offset:, :]
+        # 5. Extract per-domain Q and NS from MixerFFNOutput
+        next_q_list = [mixer_out.query_token[d] for d in self.seq_domains]
+        next_ns = torch.cat([mixer_out.user_token, mixer_out.item_token], dim=1)
 
         return next_q_list, next_ns, next_seqs, next_masks
 
@@ -1091,7 +1800,7 @@ class GroupNSTokenizer(nn.Module):
             if skip:
                 embs.append(None)
             else:
-                embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+                embs.append(nn.Embedding(int(vs) + 1, emb_dim))
         self.embs = nn.ModuleList([e for e in embs if e is not None])
         # Map from fid index to position in self.embs (or -1 if filtered)
         self._emb_index = []
@@ -1192,7 +1901,7 @@ class RankMixerNSTokenizer(nn.Module):
             if skip:
                 embs.append(None )
             else:
-                embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+                embs.append(nn.Embedding(int(vs) + 1, emb_dim))
         self.embs = nn.ModuleList([e for e in embs if e is not None])
         # Map from fid index to position in self.embs (or -1 if filtered)
         self._emb_index = []
@@ -1272,6 +1981,291 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class SENetProjection(nn.Module):
+    """SENet-style per-position feature gating for per-step embeddings.
+
+    For each position in the sequence independently, the S features (each
+    ``emb_dim``-dimensional) are squeezed over ``emb_dim`` to produce a
+    ``(B, L, S)`` descriptor, then gated through a bottleneck MLP + sigmoid
+    to get per-position, per-feature scores.  Features are weighted by
+    these scores and aggregated via summation over S.
+
+    An optional Fourier encoding ``(B, L, F)`` is concatenated after
+    aggregation before the final ``Linear(emb_dim, d_model)`` projection.
+
+    Args:
+        num_features: Number of per-step features (S).
+        emb_dim: Per-feature embedding dimension.
+        d_model: Output dimension.
+        fourier_dim: Dimension of Fourier encoding (0 = disabled).
+        reduction: Bottleneck reduction ratio for the gating MLP.
+        norm_type: Normalization type ('layer' or 'rms').
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        emb_dim: int,
+        d_model: int,
+        fourier_dim: int = 0,
+        reduction: int = 4,
+        norm_type: str = 'layer',
+    ) -> None:
+        super().__init__()
+        self.num_features = num_features
+        self.fourier_dim = fourier_dim
+
+        reduced_dim = max(num_features // reduction, 4)
+
+        # Per-position, per-feature gate: (B, L, S) → (B, L, S)
+        self.gate_net = nn.Sequential(
+            nn.Linear(num_features, reduced_dim, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(reduced_dim, num_features, bias=False),
+            nn.Sigmoid(),
+        )
+
+        proj_in_dim = emb_dim + fourier_dim
+        self.proj = nn.Sequential(
+            nn.Linear(proj_in_dim, d_model),
+            MixedNorm(d_model, norm_type),
+        )
+
+    def forward(
+        self,
+        feat_stack: torch.Tensor,
+        fourier: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            feat_stack: ``(B, L, S, emb_dim)`` stacked per-step embeddings.
+            fourier: optional ``(B, L, F)`` Fourier encoding.
+
+        Returns:
+            ``(B, L, d_model)`` tensor (pre-gelu, caller applies activation).
+        """
+        # Squeeze over embedding dim → per-position per-feature descriptor
+        squeezed = feat_stack.mean(dim=-1)  # (B, L, S)
+
+        # Gate → per-position per-feature importance scores
+        gate = self.gate_net(squeezed)  # (B, L, S)
+
+        # Rescale: (B, L, S, emb_dim) * (B, L, S, 1)
+        weighted = feat_stack * gate.unsqueeze(-1)
+
+        # Aggregate over S → (B, L, emb_dim)
+        out = weighted.sum(dim=2)
+
+        # Concat Fourier if present
+        if fourier is not None and self.fourier_dim > 0:
+            out = torch.cat([out, fourier], dim=-1)
+
+        return self.proj(out)
+
+
+class AutoNSTokenizer(nn.Module):
+    """Learnable static feature grouping with concat.
+
+    Each group selects k = n_f // n_g features (top-k by learned weight W),
+    scales each by its softmax weight, CONCAT's them (preserving per-feature
+    dimensions), then projects to d_model.
+
+    k is derived internally from n_features / num_groups — no extra
+    hyperparameter needed.
+    """
+
+    def __init__(
+        self,
+        feature_specs: List[Tuple[int, int, int]],
+        emb_dim: int,
+        d_model: int,
+        num_groups: int,
+        emb_skip_threshold: int = 0,
+        norm_type: str = 'layer',
+    ) -> None:
+        super().__init__()
+        self.feature_specs = feature_specs
+        self.emb_dim = emb_dim
+        self.num_groups = num_groups
+        n_features = len(feature_specs)
+        self.k = max(1, n_features // num_groups + 1)
+
+        # Embedding tables
+        embs = []
+        for vs, offset, length in feature_specs:
+            skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
+            if skip:
+                embs.append(None)
+            else:
+                embs.append(nn.Embedding(int(vs) + 1, emb_dim))
+        self.embs = nn.ModuleList([e for e in embs if e is not None])
+        self._emb_index = []
+        real_idx = 0
+        for e in embs:
+            if e is not None:
+                self._emb_index.append(real_idx)
+                real_idx += 1
+            else:
+                self._emb_index.append(-1)
+
+        # Static grouping matrix W (n_g × n_f)
+        self.W = nn.Parameter(torch.empty(num_groups, n_features))
+        nn.init.xavier_normal_(self.W)
+
+        # Concat(k × emb_dim) → d_model
+        self.token_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.k * emb_dim, d_model),
+                MixedNorm(d_model, norm_type),
+            )
+            for _ in range(num_groups)
+        ])
+
+        logging.info(
+            f"AutoNSTokenizer: {n_features} features → "
+            f"{num_groups} groups, k={self.k}"
+        )
+
+    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+        """Embed → top-k group → concat → project."""
+        B = int_feats.shape[0]
+
+        # Embed each feature
+        all_embs = []
+        for fid_idx, (vs, offset, length) in enumerate(self.feature_specs):
+            emb_real_idx = self._emb_index[fid_idx]
+            if emb_real_idx == -1:
+                all_embs.append(int_feats.new_zeros(B, self.emb_dim))
+            else:
+                emb_layer = self.embs[emb_real_idx]
+                if length == 1:
+                    f = emb_layer(int_feats[:, offset].long())
+                else:
+                    vals = int_feats[:, offset:offset + length].long()
+                    emb_all = emb_layer(vals)
+                    mask = (vals != 0).to(emb_all.dtype).unsqueeze(-1)
+                    count = mask.sum(dim=1).clamp(min=1)
+                    f = (emb_all * mask).sum(dim=1) / count
+                all_embs.append(f)
+        X = torch.stack(all_embs, dim=1)  # (B, n_f, emb_dim)
+
+        # Top-k grouping: each group selects its k features
+   
+        topk_weights = F.softmax(self.W, dim=-1)  # (n_g, n_f)
+        topk_scores, topk_idx = torch.topk(topk_weights, self.k, dim=-1)  # (n_g, k)
+
+        # Gather k features per group
+        idx = topk_idx.unsqueeze(0).unsqueeze(-1).expand(B, -1, -1, self.emb_dim)
+        X_exp = X.unsqueeze(1).expand(-1, self.num_groups, -1, -1)
+        grouped = torch.gather(X_exp, 2, idx)  # (B, n_g, k, emb_dim)
+
+        # Scale + concat → project → SiLU
+        topk_scores = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-8)  # Normalize scores
+        w = topk_scores.unsqueeze(0).unsqueeze(-1)  # (1, n_g, k, 1)
+        out = (grouped * w).reshape(B, self.num_groups, -1)  # (B, n_g, k*emb_dim)
+        tokens = []
+        for i in range(self.num_groups):
+            tokens.append(F.silu(self.token_projs[i](out[:, i, :].to(self.token_projs[i][0].weight.dtype))).unsqueeze(1))  # (B, 1, d_model)
+
+
+        return torch.cat(tokens, dim=1)  # (B, n_g, d_model)
+
+
+class PairedProcessor(nn.Module):
+    """Process paired int+float features into a single NS token.
+
+    For each paired fid:
+      1. Embed int values at each slot: (B, L, emb_dim)
+      2. Compute weight = log1p(float_val), zero-weight padding (float_val=0)
+      3. Normalize weights over slots: w_i = w_i / sum(w)
+      4. Weighted sum: sum(w_i * int_emb_i) → (B, emb_dim)
+    Then concat all per-fid embeddings and project to one d_model token.
+
+    Padding positions (float_val=0) naturally get zero weight via the
+    normalization, so they contribute nothing to the output token.
+    """
+
+    def __init__(
+        self,
+        feature_specs: List[Tuple[int, int, int]],  # [(vocab_size, offset, length), ...]
+        fids: List[int],                            # fid for each spec, used to look up PAIRED_FLOAT_MAX_BY_INT
+        emb_dim: int,
+        d_model: int,
+        norm_type: str = 'layer',
+    ) -> None:
+        super().__init__()
+        self.specs = feature_specs
+        self.num_paired = len(feature_specs)
+
+        self.embs = nn.ModuleList()
+        for vs, offset, length in feature_specs:
+            vs = max(vs, 1)
+            self.embs.append(nn.Embedding(vs + 1, emb_dim, padding_idx=0))
+
+        # Per-int float max lookup tables (frozen Embedding) for count-type fids.
+        # Score-type fids get a dummy Embedding(1, 1) and bypass normalization.
+        self.max_embs = nn.ModuleList()
+        self.is_count: List[bool] = []
+        for fid in fids:
+            if fid in PAIRED_FLOAT_MAX_BY_INT:
+                float_by_int = PAIRED_FLOAT_MAX_BY_INT[fid]
+                max_val = max(float_by_int.values())
+                if max_val > 10.0:  # count type
+                    max_int = max(float_by_int.keys())
+                    weight = torch.ones(max_int + 1, 1)  # default 1.0 for unseen int values
+                    for int_val, float_max in float_by_int.items():
+                        weight[int_val] = float_max
+                    self.max_embs.append(nn.Embedding.from_pretrained(weight, freeze=True))
+                    self.is_count.append(True)
+                else:  # score type (float_max all 0)
+                    emb = nn.Embedding(1, 1)
+                    emb.requires_grad_(False)
+                    self.max_embs.append(emb)
+                    self.is_count.append(False)
+            else:
+                emb = nn.Embedding(1, 1)
+                emb.requires_grad_(False)
+                self.max_embs.append(emb)
+                self.is_count.append(False)
+
+        cat_dim = self.num_paired * emb_dim
+        self.proj = nn.Sequential(
+            nn.Linear(cat_dim, d_model),
+            MixedNorm(d_model, norm_type),
+        )
+
+    def forward(
+        self,
+        paired_int_feats: torch.Tensor,
+        paired_float_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        """Returns (B, 1, d_model)."""
+        fid_embs = []
+        for i, (vs, offset, length) in enumerate(self.specs):
+            int_vals = paired_int_feats[:, offset:offset + length].long()
+            float_vals = paired_float_feats[:, offset:offset + length]
+
+            emb = self.embs[i](int_vals)  # (B, L, emb_dim)
+
+            if self.is_count[i]:
+                # Count-type: per-int global normalization (no softmax across slots)
+                per_slot_max = self.max_embs[i](int_vals).squeeze(-1)  # (B, L)
+                w = float_vals.clamp(min=0)
+                w = torch.log1p(w)
+                w = w / torch.log1p(per_slot_max)
+                w = w * (int_vals != 0).float()
+            else:
+                # Score-type: raw weights, no normalization
+                w = float_vals
+            token = (w.unsqueeze(-1) * emb).sum(dim=1)  # (B, emb_dim)
+            fid_embs.append(token)
+
+        cat = torch.cat(fid_embs, dim=-1)  # (B, num_paired * emb_dim)
+        out = self.proj(cat)               # (B, d_model)
+        return out.unsqueeze(1)            # (B, 1, d_model)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1290,6 +2284,9 @@ class PCVRHyFormer(nn.Module):
         # NS grouping config (grouped by fid index)
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
+        # Paired int+float feature specs (empty list = no paired features)
+        paired_feature_specs: List[Tuple[int, int, int]] = None,
+        paired_fids: Optional[List[int]] = None,
         # Model hyperparameters
         d_model: int = 64,
         emb_dim: int = 64,
@@ -1318,6 +2315,22 @@ class PCVRHyFormer(nn.Module):
         # Dtype control
         dense_dtype: torch.dtype = torch.float32,
         sparse_dtype: torch.dtype = torch.float32,
+        # Time feature controls
+        fourier_seq: bool = True,
+        fourier_ns: bool = True,
+        use_row_time_ns: bool = True,
+        # FFN variant for RankMixer
+        ffn_name: str = 'shared',
+        ffn_config: dict = {},
+        # Token mixer type ('rank' or 'gated')
+        mixer_type: str = 'rank',
+        # FFN variant for Seq Encoder
+        seq_ffn_name: str = 'shared',
+        seq_ffn_config: dict = {},
+        # Sequence projection variant
+        seq_proj_type: str = 'linear',
+        # Domain embedding flag
+        use_domain_emb: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1336,8 +2349,28 @@ class PCVRHyFormer(nn.Module):
         self.dense_dtype = dense_dtype
         self.sparse_dtype = sparse_dtype
         self.norm_type = norm_type
+        self.fourier_seq = fourier_seq
+        self.fourier_ns = fourier_ns
+        self.ffn_name = ffn_name
+        self.ffn_config = ffn_config
+        self.mixer_type = mixer_type
+        self.seq_ffn_name = seq_ffn_name
+        self.seq_ffn_config = seq_ffn_config
+        self.seq_proj_type = seq_proj_type
+        self.use_row_time_ns = use_row_time_ns
 
         # ================== NS Tokens Construction ==================
+
+        # Row-level time features: embedded as a dedicated NS token after item
+        # tokens (not mixed into user int feats), so time gets its own token.
+        self.has_time_ns = use_row_time_ns
+        if use_row_time_ns:
+            # 8 hour segments: 3-6→0, 7-10→1, 11-12→2, 13-14→3, 15-16→4, 17-19→5, 20-22→6, 23,24,1,2→7
+            self.register_buffer(
+                'hour_to_segment',
+                torch.tensor([0, 7,7, 0,0,0,0, 1,1,1,1, 2,2, 3,3, 4,4, 5,5,5, 6,6,6, 7,7],
+                             dtype=torch.long))
+            self.time_code_emb = nn.Embedding(16, d_model)
 
         if ns_tokenizer_type == 'group':
             # Original: one NS token per group
@@ -1388,6 +2421,31 @@ class PCVRHyFormer(nn.Module):
                 norm_type=norm_type,
             )
             num_item_ns = item_ns_tokens
+        elif ns_tokenizer_type == 'auto':
+            # Auto mode: use the same tokenizer for both user and item
+            if user_ns_tokens <= 0:
+                user_ns_tokens = len(user_ns_groups)
+            if item_ns_tokens <= 0:
+                item_ns_tokens = len(item_ns_groups)
+            self.user_ns_tokenizer = AutoNSTokenizer(
+                feature_specs=user_int_feature_specs,
+                emb_dim=emb_dim,
+                d_model=d_model,
+                num_groups=user_ns_tokens,
+                emb_skip_threshold=emb_skip_threshold,
+                norm_type=norm_type,
+            )
+            num_user_ns = user_ns_tokens
+
+            self.item_ns_tokenizer = AutoNSTokenizer(
+                feature_specs=item_int_feature_specs,
+                emb_dim=emb_dim,
+                d_model=d_model,
+                num_groups=item_ns_tokens,
+                emb_skip_threshold=emb_skip_threshold,
+                norm_type=norm_type,
+            )
+            num_item_ns = item_ns_tokens
         else:
             raise ValueError(f"Unknown ns_tokenizer_type: {ns_tokenizer_type}")
 
@@ -1407,10 +2465,36 @@ class PCVRHyFormer(nn.Module):
                 MixedNorm(d_model, norm_type),
             )
 
+        # Domain embeddings for NS/Q tokens (so token mixing can distinguish user/item/query)
+        self.use_domain_emb = use_domain_emb
+        if use_domain_emb:
+            self.user_domain_emb = nn.Parameter(torch.zeros(1, 1, d_model))
+            self.item_domain_emb = nn.Parameter(torch.zeros(1, 1, d_model))
+            self.query_domain_emb = nn.Parameter(torch.zeros(1, 1, d_model))
+
+        # Paired int+float processor
+        paired_feature_specs = paired_feature_specs or []
+        self.has_paired = len(paired_feature_specs) > 0
+        if self.has_paired:
+            self.paired_processor = PairedProcessor(
+                feature_specs=paired_feature_specs,
+                fids=paired_fids or [],
+                emb_dim=emb_dim,
+                d_model=d_model,
+                norm_type=norm_type,
+            )
+        num_paired = len(paired_feature_specs)
+        num_paired_tokens = 1 if self.has_paired else 0
+
         # Total NS token count
-        self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
+        self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0) + num_paired_tokens
                        + num_item_ns + (1 if self.has_item_dense else 0)
-                       + 3)  # +3 for row-level hour, dow, weekend tokens
+                       + (1 if self.has_time_ns else 0))
+
+        # Token group boundaries for MixerFFNInput split/merge in blocks
+        _user_token_num = num_user_ns + (1 if self.has_user_dense else 0) + num_paired_tokens
+        _item_token_num = (num_item_ns + (1 if self.has_item_dense else 0)
+                           + (1 if self.has_time_ns else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1419,7 +2503,9 @@ class PCVRHyFormer(nn.Module):
             raise ValueError(
                 f"d_model={d_model} must be divisible by T=num_queries*num_sequences+num_ns="
                 f"{num_queries}*{self.num_sequences}+{self.num_ns}={T}. "
-                f"Valid T values for d_model={d_model}: {valid_T_values}"
+                f"Valid T values for d_model={d_model}: {valid_T_values}. "
+                f"Hint: paired features add 1 NS token. "
+                f"Set rank_mixer_mode=none in config if you cannot adjust d_model."
             )
 
         # ================== Seq Tokens Embedding ==================
@@ -1437,7 +2523,7 @@ class PCVRHyFormer(nn.Module):
                 if skip:
                     embs_raw.append(None)
                 else:
-                    embs_raw.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+                    embs_raw.append(nn.Embedding(int(vs) + 1, emb_dim))
             module_list = nn.ModuleList([e for e in embs_raw if e is not None])
             # Map from position index to real index in module_list (-1 if skipped)
             index_map = []
@@ -1465,22 +2551,31 @@ class PCVRHyFormer(nn.Module):
             self._seq_emb_index[domain] = idx_map
             self._seq_is_id[domain] = is_id
             self._seq_vocab_sizes[domain] = vs
-            self._seq_proj[domain] = nn.Sequential(
-                nn.Linear(len(vs) * emb_dim, d_model),
-                MixedNorm(d_model, norm_type),
-            )
+            if seq_proj_type == 'senet':
+                self._seq_proj[domain] = SENetProjection(
+                    num_features=len(vs),
+                    emb_dim=emb_dim,
+                    d_model=d_model,
+                    fourier_dim=emb_dim if fourier_seq else 0,
+                    norm_type=norm_type,
+                )
+            else:
+                fourier_add_dim = emb_dim if fourier_seq else 0
+                self._seq_proj[domain] = nn.Sequential(
+                    nn.Linear(len(vs) * emb_dim + fourier_add_dim, d_model),
+                    MixedNorm(d_model, norm_type),
+                )
 
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
-            self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+            self.time_embedding = nn.Embedding(num_time_buckets, d_model)
 
         # ================== Fourier Time Encoding ==================
-        self.time_fourier = FourierTimeEncoding(d_model=d_model)
+        if fourier_ns:
+            self.time_fourier = FourierTimeEncoding(d_model=d_model)
+        if fourier_seq:
+            self.seq_time_fourier = FourierTimeEncoding(d_model=emb_dim)
 
-        # ================== Discrete Row-level Time Embeddings ==================
-        self.row_hour_emb = nn.Embedding(24 + 1, d_model, padding_idx=0)
-        self.row_dow_emb = nn.Embedding(7 + 1, d_model, padding_idx=0)
-        self.row_weekend_emb = nn.Embedding(2 + 1, d_model, padding_idx=0)
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
@@ -1508,6 +2603,14 @@ class PCVRHyFormer(nn.Module):
                 causal=seq_causal,
                 rank_mixer_mode=rank_mixer_mode,
                 norm_type=norm_type,
+                ffn_name=ffn_name,
+                ffn_config=ffn_config,
+                mixer_type=mixer_type,
+                seq_ffn_name=seq_ffn_name,
+                seq_ffn_config=seq_ffn_config,
+                user_token_num=_user_token_num,
+                item_token_num=_item_token_num,
+                seq_domains=self.seq_domains,
             )
             for _ in range(num_hyformer_blocks)
         ])
@@ -1578,11 +2681,6 @@ class PCVRHyFormer(nn.Module):
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
 
-        # Row-level time features (always preserved, never reinitialized)
-        for emb in [self.row_hour_emb, self.row_dow_emb, self.row_weekend_emb]:
-            nn.init.xavier_normal_(emb.weight.data)
-            emb.weight.data[0, :] = 0
-
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
     ) -> "set[int]":
@@ -1636,10 +2734,9 @@ class PCVRHyFormer(nn.Module):
                 else:
                     skip_count += 1
 
-        # time_embedding and row-level time features are always preserved
+        # time_embedding is always preserved
         if self.num_time_buckets > 0:
             skip_count += 1
-        skip_count += 3  # row_hour_emb, row_dow_emb, row_weekend_emb
 
         logging.info(f"Re-initialized {reinit_count} high-cardinality Embeddings "
                      f"(vocab>{cardinality_threshold}), kept {skip_count}")
@@ -1692,8 +2789,20 @@ class PCVRHyFormer(nn.Module):
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        fourier_ts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
+        """Embeds a sequence domain and projects to d_model.
+
+        Two projection modes (controlled by ``seq_proj_type``):
+
+        * linear (default): each per-step feature is embedded independently,
+          then all S features are concatenated along the last dim together with
+          an optional Fourier encoding, and projected via ``Linear(S*emb, d_model)``.
+
+        * senet: features are stacked as ``(B, L, S, emb_dim)`` and passed to
+          ``SENetProjection`` together with the Fourier encoding for sample-adaptive
+          gating and aggregation.
+        """
         B, S, L = seq.shape
         emb_list = []
         for i in range(S):
@@ -1707,8 +2816,25 @@ class PCVRHyFormer(nn.Module):
                 if is_id[i] and self.training:
                     e = self.seq_id_emb_dropout(e)
                 emb_list.append(e)
-        cat_emb = torch.cat(emb_list, dim=-1)  # (B, L, S*emb_dim)
-        token_emb = F.gelu(proj(cat_emb.to(self.dense_dtype)))  # (B, L, D)
+
+        # Optional Fourier encoding
+        fourier_enc = None
+        if fourier_ts is not None and hasattr(self, 'seq_time_fourier'):
+            fourier_enc = self.seq_time_fourier(fourier_ts)  # (B, L, emb_dim)
+
+        if self.seq_proj_type == 'senet':
+            # SENet: (B, L, S, emb_dim) + optional (B, L, emb_dim) Fourier
+            feat_stack = torch.stack(emb_list, dim=2)  # (B, L, S, emb_dim)
+            token_emb = F.gelu(
+                proj(feat_stack.to(self.dense_dtype),
+                     fourier_enc.to(self.dense_dtype) if fourier_enc is not None else None)
+            )
+        else:
+            # Original: flatten all features + optional Fourier
+            cat_emb = torch.cat(emb_list, dim=-1)  # (B, L, S*emb_dim)
+            if fourier_enc is not None:
+                cat_emb = torch.cat([cat_emb, fourier_enc.to(cat_emb.dtype)], dim=-1)
+            token_emb = F.gelu(proj(cat_emb.to(self.dense_dtype)))  # (B, L, D)
 
         # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
         if self.num_time_buckets > 0:
@@ -1774,25 +2900,46 @@ class PCVRHyFormer(nn.Module):
 
         return output
 
-    def forward(self, inputs: ModelInput) -> torch.Tensor:
+    def forward(self, inputs: ModelInput) -> ModelOutput:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats).to(self.dense_dtype)   # (B, num_user_groups, D)
+        user_int_feats = inputs.user_int_feats
+
+        user_ns = self.user_ns_tokenizer(user_int_feats).to(self.dense_dtype)   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats).to(self.dense_dtype)   # (B, num_item_groups, D)
+
+        if self.use_domain_emb:
+            user_ns = user_ns + self.user_domain_emb
+            item_ns = item_ns + self.item_domain_emb
 
         ns_parts = [user_ns]
         if self.has_user_dense:
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats.to(self.dense_dtype))).unsqueeze(1)  # (B, 1, D)
+            if self.use_domain_emb:
+                user_dense_tok = user_dense_tok + self.user_domain_emb
             ns_parts.append(user_dense_tok)
+        if self.has_paired:
+            paired_tokens = self.paired_processor(inputs.paired_int_feats, inputs.paired_float_feats).to(self.dense_dtype)  # (B, num_paired, D)
+            if self.use_domain_emb:
+                paired_tokens = paired_tokens + self.user_domain_emb
+            ns_parts.append(paired_tokens)
         ns_parts.append(item_ns)
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats.to(self.dense_dtype))).unsqueeze(1)  # (B, 1, D)
+            if self.use_domain_emb:
+                item_dense_tok = item_dense_tok + self.item_domain_emb
             ns_parts.append(item_dense_tok)
-
-        # Row-level discrete time tokens (hour, dow, weekend)
-        ns_parts.append(self.row_hour_emb(inputs.hour).to(self.dense_dtype).unsqueeze(1))
-        ns_parts.append(self.row_dow_emb(inputs.dow).to(self.dense_dtype).unsqueeze(1))
-        ns_parts.append(self.row_weekend_emb(inputs.weekend).to(self.dense_dtype).unsqueeze(1))
+        if self.has_time_ns:
+            seg = self.hour_to_segment[inputs.hour]                # (B,)
+            # 深夜(1-2点)属于前一天的时段，用前一天的 DOW 判断 workday
+            effective_dow = torch.where(
+                inputs.hour <= 2,
+                (inputs.dow - 2) % 7 + 1,                          # 前一天
+                inputs.dow                                          # 当天
+            )
+            is_workday = (effective_dow <= 5).long()                # Mon-Fri=1, Sat-Sun=0
+            t = self.time_code_emb(is_workday * 8 + seg)           # (B, D)
+            ns_parts.append(t.unsqueeze(1))                        # (B, 1, D)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
@@ -1804,19 +2951,21 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                fourier_ts=inputs.seq_timestamps[domain] if self.fourier_seq else None)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        if self.use_domain_emb:
+            q_tokens_list = [q + self.query_domain_emb for q in q_tokens_list]
 
-        # 4. Fourier time encoding on all tokens before attention blocks
-        for i, domain in enumerate(self.seq_domains):
-            seq_tokens_list[i] = seq_tokens_list[i] + self.time_fourier(inputs.seq_timestamps[domain])
-        ns_tokens = ns_tokens + self.time_fourier(inputs.timestamp.unsqueeze(-1))
-        q_tokens_list = [q + self.time_fourier(inputs.timestamp.unsqueeze(-1)) for q in q_tokens_list]
+        # 4. Fourier time encoding on NS and Q tokens (seq tokens encode it inside _embed_seq_domain)
+        if self.fourier_ns:
+            ns_tokens = ns_tokens + self.time_fourier(inputs.timestamp.unsqueeze(-1))
+            q_tokens_list = [q + self.time_fourier(inputs.timestamp.unsqueeze(-1)) for q in q_tokens_list]
 
         # 5. Dropout + MultiSeqHyFormerBlock stack + output projection
         output = self._run_multi_seq_blocks(
@@ -1826,27 +2975,46 @@ class PCVRHyFormer(nn.Module):
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
-        return logits
+        return ModelOutput(logits=logits, embeddings=output, ns_tokens=ns_tokens)
 
-    def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Runs inference without dropout, returning both logits and embeddings."""
-        # Reuses forward logic but without dropout
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats).to(self.dense_dtype)
+    def predict(self, inputs: ModelInput) -> ModelOutput:
+        """Runs inference without dropout, returning logits, embeddings and ns_tokens."""
+        user_int_feats = inputs.user_int_feats
+
+        user_ns = self.user_ns_tokenizer(user_int_feats).to(self.dense_dtype)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats).to(self.dense_dtype)
+
+        if self.use_domain_emb:
+            user_ns = user_ns + self.user_domain_emb
+            item_ns = item_ns + self.item_domain_emb
 
         ns_parts = [user_ns]
         if self.has_user_dense:
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats.to(self.dense_dtype))).unsqueeze(1)
+            if self.use_domain_emb:
+                user_dense_tok = user_dense_tok + self.user_domain_emb
             ns_parts.append(user_dense_tok)
+        if self.has_paired:
+            paired_tokens = self.paired_processor(inputs.paired_int_feats, inputs.paired_float_feats).to(self.dense_dtype)
+            if self.use_domain_emb:
+                paired_tokens = paired_tokens + self.user_domain_emb
+            ns_parts.append(paired_tokens)
         ns_parts.append(item_ns)
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats.to(self.dense_dtype))).unsqueeze(1)
+            if self.use_domain_emb:
+                item_dense_tok = item_dense_tok + self.item_domain_emb
             ns_parts.append(item_dense_tok)
-
-        # Row-level discrete time tokens (hour, dow, weekend)
-        ns_parts.append(self.row_hour_emb(inputs.hour).to(self.dense_dtype).unsqueeze(1))
-        ns_parts.append(self.row_dow_emb(inputs.dow).to(self.dense_dtype).unsqueeze(1))
-        ns_parts.append(self.row_weekend_emb(inputs.weekend).to(self.dense_dtype).unsqueeze(1))
+        if self.has_time_ns:
+            seg = self.hour_to_segment[inputs.hour]
+            effective_dow = torch.where(
+                inputs.hour <= 2,
+                (inputs.dow - 2) % 7 + 1,
+                inputs.dow
+            )
+            is_workday = (effective_dow <= 5).long()
+            t = self.time_code_emb(is_workday * 8 + seg)
+            ns_parts.append(t.unsqueeze(1))
 
         ns_tokens = torch.cat(ns_parts, dim=1)
 
@@ -1857,18 +3025,20 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                fourier_ts=inputs.seq_timestamps[domain] if self.fourier_seq else None)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        if self.use_domain_emb:
+            q_tokens_list = [q + self.query_domain_emb for q in q_tokens_list]
 
-        # Fourier time encoding on all tokens before attention blocks
-        for i, domain in enumerate(self.seq_domains):
-            seq_tokens_list[i] = seq_tokens_list[i] + self.time_fourier(inputs.seq_timestamps[domain])
-        ns_tokens = ns_tokens + self.time_fourier(inputs.timestamp.unsqueeze(-1))
-        q_tokens_list = [q + self.time_fourier(inputs.timestamp.unsqueeze(-1)) for q in q_tokens_list]
+        # Fourier time encoding on NS and Q tokens (seq tokens encode it inside _embed_seq_domain)
+        if self.fourier_ns:
+            ns_tokens = ns_tokens + self.time_fourier(inputs.timestamp.unsqueeze(-1))
+            q_tokens_list = [q + self.time_fourier(inputs.timestamp.unsqueeze(-1)) for q in q_tokens_list]
 
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
@@ -1876,4 +3046,4 @@ class PCVRHyFormer(nn.Module):
         )
 
         logits = self.clsfier(output)
-        return logits, output
+        return ModelOutput(logits=logits, embeddings=output, ns_tokens=ns_tokens)
