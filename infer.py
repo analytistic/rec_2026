@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 
 from src.dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS
 from src.model import PCVRHyFormer, ModelInput
+from src.paired_float_stats import FREQ_HASH_CONFIG
 
 
 logging.basicConfig(
@@ -81,6 +82,7 @@ _FALLBACK_MODEL_CFG = {
     'seq_ffn_config': {},
     'mixer_type': 'rank',
     'use_domain_emb': False,
+    'hash_embedding': {},
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -238,7 +240,32 @@ def build_model(
         dataset.paired_int_schema, dataset.paired_int_vocab_sizes) if hasattr(dataset, 'paired_int_schema') else []
     paired_fids = [fid for fid, _, _ in dataset.paired_int_schema.entries] if hasattr(dataset, 'paired_int_schema') else []
 
+    # ---- Hash embedding config: convert fid → fid_idx ----
+    raw_hash = model_cfg.get('hash_embedding', {})
+    item_hash_config: Dict[int, Any] = {}
+    item_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(dataset.item_int_schema.entries)}
+    for fid, H in raw_hash.items():
+        if fid not in item_fid_to_idx:
+            logging.warning(f"hash_embedding fid {fid} not found in item_int_schema, skipping")
+            continue
+        if fid in FREQ_HASH_CONFIG:
+            item_hash_config[item_fid_to_idx[fid]] = FREQ_HASH_CONFIG[fid]
+        else:
+            item_hash_config[item_fid_to_idx[fid]] = H
+
+    user_hash_config: Dict[int, Any] = {}
+    user_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(dataset.user_int_schema.entries)}
+    for fid, H in raw_hash.items():
+        if fid not in user_fid_to_idx:
+            continue
+        if fid in FREQ_HASH_CONFIG:
+            user_hash_config[user_fid_to_idx[fid]] = FREQ_HASH_CONFIG[fid]
+        else:
+            user_hash_config[user_fid_to_idx[fid]] = H
+
     logging.info(f"Building PCVRHyFormer with cfg: {model_cfg}")
+    # hash_embedding is consumed above; don't pass it to PCVRHyFormer
+    model_cfg.pop('hash_embedding', None)
     model = PCVRHyFormer(
         user_int_feature_specs=user_int_feature_specs,
         item_int_feature_specs=item_int_feature_specs,
@@ -247,6 +274,8 @@ def build_model(
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
         user_ns_groups=user_ns_groups,
         item_ns_groups=item_ns_groups,
+        item_hash_config=item_hash_config,
+        user_hash_config=user_hash_config,
         paired_feature_specs=paired_feature_specs,
         paired_fids=paired_fids,
         **model_cfg,
