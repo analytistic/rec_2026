@@ -24,6 +24,7 @@ from .utils import set_seed, EarlyStopping, create_logger
 from .dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
 from .model import PCVRHyFormer
 from .trainer import PCVRHyFormerRankingTrainer
+from .paired_float_stats import FREQ_HASH_CONFIG
 
 
 _DTYPE_MAP = {
@@ -170,6 +171,34 @@ def main() -> None:
         user_ns_groups = [[i] for i in range(len(pcvr_dataset.user_int_schema.entries))]
         item_ns_groups = [[i] for i in range(len(pcvr_dataset.item_int_schema.entries))]
 
+    # ---- Hash embedding config: convert fid → fid_idx for item features ----
+    raw_hash = cfg.get('hash_embedding', {})
+    item_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.item_int_schema.entries)}
+    item_hash_config = {}
+    for fid, H in raw_hash.items():
+        if fid not in item_fid_to_idx:
+            logging.warning(f"hash_embedding fid {fid} not found in item_int_schema, skipping")
+            continue
+        if fid in FREQ_HASH_CONFIG:
+            item_hash_config[item_fid_to_idx[fid]] = FREQ_HASH_CONFIG[fid]
+        else:
+            item_hash_config[item_fid_to_idx[fid]] = H
+    if item_hash_config:
+        logging.info(f"Item hash config: {item_hash_config}")
+
+    # ---- Hash embedding config for user features ----
+    user_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.user_int_schema.entries)}
+    user_hash_config = {}
+    for fid, H in raw_hash.items():
+        if fid not in user_fid_to_idx:
+            continue
+        if fid in FREQ_HASH_CONFIG:
+            user_hash_config[user_fid_to_idx[fid]] = FREQ_HASH_CONFIG[fid]
+        else:
+            user_hash_config[user_fid_to_idx[fid]] = H
+    if user_hash_config:
+        logging.info(f"User hash config: {user_hash_config}")
+
     # ---- Build model ----
     user_int_feature_specs = build_feature_specs(
         pcvr_dataset.user_int_schema, pcvr_dataset.user_int_vocab_sizes)
@@ -187,6 +216,8 @@ def main() -> None:
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,
         "item_ns_groups": item_ns_groups,
+        "item_hash_config": item_hash_config,
+        "user_hash_config": user_hash_config,
         "paired_feature_specs": paired_feature_specs,
         "paired_fids": paired_fids,
         "d_model": cfg['d_model'],

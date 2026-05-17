@@ -60,6 +60,16 @@ item_ns_tokens: 4
 ns_groups_json: ""
 rank_mixer_mode: full
 
+# ─── Hash Embedding ─────────────────────────────────────────────────────────
+# For features with unstable vocab across train/test, use hash embedding.
+# Key = fid, value = hash bucket size (H). Omitted fids use standard Embedding.
+hash_embedding:
+  7: 512
+  8: 512
+  12: 512
+  16: 4096
+  54: 512
+
 # ─── FFN ─────────────────────────────────────────────────────────────────────
 ffn_name: shared
 ffn_config: {}

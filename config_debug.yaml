@@ -65,6 +65,13 @@ use_row_time_ns: true
 add_seq_time_attrs: true
 use_domain_emb: true
 
+hash_embedding:
+  7: 512
+  8: 512
+  12: 512
+  16: 4096
+  54: 512
+
 loss_type: bce
 focal_alpha: 0.1
 focal_gamma: 2.0

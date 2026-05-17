@@ -2,7 +2,7 @@
 
 import logging
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -1874,6 +1874,7 @@ class RankMixerNSTokenizer(nn.Module):
         num_ns_tokens: int,
         emb_skip_threshold: int = 0,
         norm_type: str = 'layer',
+        hash_config: Optional[Dict[int, Any]] = None,
     ) -> None:
         """Initializes RankMixerNSTokenizer.
 
@@ -1885,6 +1886,11 @@ class RankMixerNSTokenizer(nn.Module):
             num_ns_tokens: Number of NS tokens to produce (T segments).
             emb_skip_threshold: Skip embedding for features with vocab > threshold.
             norm_type: Normalization type ('layer' or 'rms').
+            hash_config: Optional mapping of fid_idx → config.
+                - int: pure hash embedding with this bucket size (H).
+                - dict: freq+hash embedding with keys:
+                  "top_values": list of frequent ints for direct lookup,
+                  "K": len(top_values), "H": hash bucket size.
         """
         super().__init__()
         self.feature_specs = feature_specs
@@ -1892,16 +1898,33 @@ class RankMixerNSTokenizer(nn.Module):
         self.emb_dim = emb_dim
         self.num_ns_tokens = num_ns_tokens
         self.emb_skip_threshold = emb_skip_threshold
+        self.hash_config = hash_config or {}
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
         embs = []
-        for vs, offset, length in feature_specs:
-            skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
-            if skip:
-                embs.append(None )
+        self._is_hash = [False] * len(feature_specs)
+        self._is_freq_hash = [False] * len(feature_specs)
+        for fid_idx, (vs, offset, length) in enumerate(feature_specs):
+            if fid_idx in self.hash_config:
+                cfg = self.hash_config[fid_idx]
+                if isinstance(cfg, dict):
+                    # Freq+hash embedding: Embedding(1 + K + H, emb_dim)
+                    H = cfg['H']
+                    K = cfg['K']
+                    embs.append(nn.Embedding(1 + K + H, emb_dim))
+                    self._is_freq_hash[fid_idx] = True
+                else:
+                    # Pure hash embedding
+                    H = int(cfg)
+                    embs.append(nn.Embedding(H, emb_dim))
+                    self._is_hash[fid_idx] = True
             else:
-                embs.append(nn.Embedding(int(vs) + 1, emb_dim))
+                skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
+                if skip:
+                    embs.append(None)
+                else:
+                    embs.append(nn.Embedding(int(vs) + 1, emb_dim))
         self.embs = nn.ModuleList([e for e in embs if e is not None])
         # Map from fid index to position in self.embs (or -1 if filtered)
         self._emb_index = []
@@ -1947,6 +1970,7 @@ class RankMixerNSTokenizer(nn.Module):
             (B, num_ns_tokens, d_model) tensor.
         """
         # 1. Embed all fids in group order → flat cat
+        _HASH_PRIME = 100003
         all_embs = []
         for group in self.groups:
             for fid_idx in group:
@@ -1954,6 +1978,27 @@ class RankMixerNSTokenizer(nn.Module):
                 emb_real_idx = self._emb_index[fid_idx]
                 if emb_real_idx == -1:
                     fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
+                elif self._is_hash[fid_idx]:
+                    H = self.hash_config[fid_idx]
+                    vals = int_feats[:, offset].long()
+                    hash_idx = (_HASH_PRIME * fid_idx + vals) % (H - 1) + 1
+                    hash_idx = torch.where(vals == 0, 0, hash_idx)
+                    fid_emb = self.embs[emb_real_idx](hash_idx)
+                elif self._is_freq_hash[fid_idx]:
+                    cfg = self.hash_config[fid_idx]
+                    K = cfg['K']
+                    H = cfg['H']
+                    top_values = cfg['top_values']
+                    vals = int_feats[:, offset].long()  # (B,)
+                    # Direct lookup for known values → idx 1..K
+                    direct_idx = torch.zeros_like(vals)
+                    for i, v in enumerate(top_values):
+                        direct_idx = torch.where(vals == v, i + 1, direct_idx)
+                    # Hash for unknown values → idx K+1..K+H
+                    hash_idx = (_HASH_PRIME * fid_idx + vals) % H + K + 1
+                    hash_idx = torch.where(vals == 0, 0, hash_idx)
+                    idx = torch.where(direct_idx > 0, direct_idx, hash_idx)
+                    fid_emb = self.embs[emb_real_idx](idx)
                 else:
                     emb_layer = self.embs[emb_real_idx]
                     if length == 1:
@@ -1962,8 +2007,14 @@ class RankMixerNSTokenizer(nn.Module):
                         vals = int_feats[:, offset:offset + length].long()
                         emb_all = emb_layer(vals)
                         mask = (vals != 0).to(emb_all.dtype).unsqueeze(-1)
-                        count = mask.sum(dim=1).clamp(min=1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count
+                        count = mask.sum(dim=1)
+                        sum_emb = (emb_all * mask).sum(dim=1)
+                        pad_emb = emb_layer(torch.zeros(1, dtype=torch.long, device=vals.device))
+                        fid_emb = torch.where(
+                            count.expand_as(sum_emb) > 0,
+                            sum_emb / count.clamp(min=1),
+                            pad_emb,
+                        )
                 all_embs.append(fid_emb)
 
         cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
@@ -2201,7 +2252,7 @@ class PairedProcessor(nn.Module):
         self.embs = nn.ModuleList()
         for vs, offset, length in feature_specs:
             vs = max(vs, 1)
-            self.embs.append(nn.Embedding(vs + 1, emb_dim, padding_idx=0))
+            self.embs.append(nn.Embedding(vs + 1, emb_dim))
 
         # Per-int float max lookup tables (frozen Embedding) for count-type fids.
         # Score-type fids get a dummy Embedding(1, 1) and bypass normalization.
@@ -2258,7 +2309,10 @@ class PairedProcessor(nn.Module):
             else:
                 # Score-type: raw weights, no normalization
                 w = float_vals
+            total_w = w.sum(dim=1, keepdim=True)  # (B, 1)
             token = (w.unsqueeze(-1) * emb).sum(dim=1)  # (B, emb_dim)
+            pad_emb = self.embs[i](torch.zeros(1, dtype=torch.long, device=int_vals.device)).squeeze(0)
+            token = torch.where(total_w > 0, token, pad_emb)
             fid_embs.append(token)
 
         cat = torch.cat(fid_embs, dim=-1)  # (B, num_paired * emb_dim)
@@ -2284,6 +2338,10 @@ class PCVRHyFormer(nn.Module):
         # NS grouping config (grouped by fid index)
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
+        # Hash embedding config for item features (fid_idx → H)
+        item_hash_config: Optional[Dict[int, int]] = None,
+        # Hash embedding config for user features (fid_idx → H)
+        user_hash_config: Optional[Dict[int, int]] = None,
         # Paired int+float feature specs (empty list = no paired features)
         paired_feature_specs: List[Tuple[int, int, int]] = None,
         paired_fids: Optional[List[int]] = None,
@@ -2408,6 +2466,7 @@ class PCVRHyFormer(nn.Module):
                 num_ns_tokens=user_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
                 norm_type=norm_type,
+                hash_config=user_hash_config,
             )
             num_user_ns = user_ns_tokens
 
@@ -2419,6 +2478,7 @@ class PCVRHyFormer(nn.Module):
                 num_ns_tokens=item_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
                 norm_type=norm_type,
+                hash_config=item_hash_config,
             )
             num_item_ns = item_ns_tokens
         elif ns_tokenizer_type == 'auto':
