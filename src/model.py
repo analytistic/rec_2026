@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, NamedTuple, Tuple, Optional, Union
 
+_HASH_PRIMES = [100003, 200003, 300007, 500009]
+
 from .paired_float_stats import PAIRED_FLOAT_MAX_BY_INT
 
 
@@ -1886,11 +1888,7 @@ class RankMixerNSTokenizer(nn.Module):
             num_ns_tokens: Number of NS tokens to produce (T segments).
             emb_skip_threshold: Skip embedding for features with vocab > threshold.
             norm_type: Normalization type ('layer' or 'rms').
-            hash_config: Optional mapping of fid_idx → config.
-                - int: pure hash embedding with this bucket size (H).
-                - dict: freq+hash embedding with keys:
-                  "top_values": list of frequent ints for direct lookup,
-                  "K": len(top_values), "H": hash bucket size.
+            hash_config: Optional mapping of fid_idx → {H, k} for multi-hash embedding.
         """
         super().__init__()
         self.feature_specs = feature_specs
@@ -1901,42 +1899,40 @@ class RankMixerNSTokenizer(nn.Module):
         self.hash_config = hash_config or {}
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
-        # or if vocab_size <= 0 / no vocab info).
-        embs = []
-        self._is_hash = [False] * len(feature_specs)
-        self._is_freq_hash = [False] * len(feature_specs)
+        # or if vocab_size <= 0 / no vocab info). Hash features are excluded
+        # from embs and stored separately in hash_embs.
+        self._hash_multi: Dict[int, dict] = {}
+        embs_raw = []
         for fid_idx, (vs, offset, length) in enumerate(feature_specs):
             if fid_idx in self.hash_config:
                 cfg = self.hash_config[fid_idx]
-                if isinstance(cfg, dict):
-                    # Freq+hash embedding: Embedding(1 + K + H, emb_dim)
-                    H = cfg['H']
-                    K = cfg['K']
-                    embs.append(nn.Embedding(1 + K + H, emb_dim))
-                    self._is_freq_hash[fid_idx] = True
-                else:
-                    # Pure hash embedding
-                    H = int(cfg)
-                    embs.append(nn.Embedding(H, emb_dim))
-                    self._is_hash[fid_idx] = True
+                H = cfg['H']
+                k = cfg['k']
+                chunk_dim = emb_dim // k
+                self._hash_multi[fid_idx] = {'H': H, 'k': k, 'chunk_dim': chunk_dim}
+                embs_raw.append(None)  # not in embs; handled by hash_embs
             else:
                 skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
-                if skip:
-                    embs.append(None)
-                else:
-                    embs.append(nn.Embedding(int(vs) + 1, emb_dim))
-        self.embs = nn.ModuleList([e for e in embs if e is not None])
-        # Map from fid index to position in self.embs (or -1 if filtered)
+                embs_raw.append(None if skip else nn.Embedding(int(vs) + 1, emb_dim))
+        self.embs = nn.ModuleList([e for e in embs_raw if e is not None])
         self._emb_index = []
         real_idx = 0
-        for e in embs:
+        for e in embs_raw:
             if e is not None:
                 self._emb_index.append(real_idx)
                 real_idx += 1
             else:
                 self._emb_index.append(-1)
 
-        # Compute total embedding dim: sum of all fids across all groups
+        # Separate ModuleList for multi-hash sub-embeddings
+        self.hash_embs = nn.ModuleList()
+        for fid_idx in sorted(self._hash_multi.keys()):
+            cfg = self._hash_multi[fid_idx]
+            H, k, chunk_dim = cfg['H'], cfg['k'], cfg['chunk_dim']
+            start = len(self.hash_embs)
+            for _ in range(k):
+                self.hash_embs.append(nn.Embedding(H, chunk_dim))
+            cfg['start'] = start
         total_num_fids = sum(len(g) for g in groups)
         total_emb_dim = total_num_fids * emb_dim
 
@@ -1970,35 +1966,26 @@ class RankMixerNSTokenizer(nn.Module):
             (B, num_ns_tokens, d_model) tensor.
         """
         # 1. Embed all fids in group order → flat cat
-        _HASH_PRIME = 100003
         all_embs = []
         for group in self.groups:
             for fid_idx in group:
                 vs, offset, length = self.feature_specs[fid_idx]
                 emb_real_idx = self._emb_index[fid_idx]
                 if emb_real_idx == -1:
-                    fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
-                elif self._is_hash[fid_idx]:
-                    H = self.hash_config[fid_idx]
-                    vals = int_feats[:, offset].long()
-                    hash_idx = (_HASH_PRIME * fid_idx + vals) % (H - 1) + 1
-                    hash_idx = torch.where(vals == 0, 0, hash_idx)
-                    fid_emb = self.embs[emb_real_idx](hash_idx)
-                elif self._is_freq_hash[fid_idx]:
-                    cfg = self.hash_config[fid_idx]
-                    K = cfg['K']
-                    H = cfg['H']
-                    top_values = cfg['top_values']
-                    vals = int_feats[:, offset].long()  # (B,)
-                    # Direct lookup for known values → idx 1..K
-                    direct_idx = torch.zeros_like(vals)
-                    for i, v in enumerate(top_values):
-                        direct_idx = torch.where(vals == v, i + 1, direct_idx)
-                    # Hash for unknown values → idx K+1..K+H
-                    hash_idx = (_HASH_PRIME * fid_idx + vals) % H + K + 1
-                    hash_idx = torch.where(vals == 0, 0, hash_idx)
-                    idx = torch.where(direct_idx > 0, direct_idx, hash_idx)
-                    fid_emb = self.embs[emb_real_idx](idx)
+                    if fid_idx in self._hash_multi:
+                        cfg = self._hash_multi[fid_idx]
+                        k, H = cfg['k'], cfg['H']
+                        start = cfg['start']
+                        vals = int_feats[:, offset].long()
+                        parts = []
+                        for j in range(k):
+                            emb = self.hash_embs[start + j]
+                            hash_idx = (_HASH_PRIMES[j] * (fid_idx + 1) + vals) % (H - 1) + 1
+                            hash_idx = torch.where(vals == 0, 0, hash_idx)
+                            parts.append(emb(hash_idx))
+                        fid_emb = torch.cat(parts, dim=-1)
+                    else:
+                        fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
                 else:
                     emb_layer = self.embs[emb_real_idx]
                     if length == 1:
@@ -2389,6 +2376,8 @@ class PCVRHyFormer(nn.Module):
         seq_proj_type: str = 'linear',
         # Domain embedding flag
         use_domain_emb: bool = False,
+        # Seq multi-hash embedding config: {domain: {pos: {H, k}}}
+        seq_hash_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
 
@@ -2574,16 +2563,26 @@ class PCVRHyFormer(nn.Module):
         # independent of emb_skip_threshold (which skips Embedding creation).
         self.seq_id_emb_dropout = nn.Dropout(seq_id_dropout_rate)
 
-        def _make_seq_embs(vocab_sizes):
+        def _make_seq_embs(vocab_sizes, domain_hash_config=None):
             """Create embedding list, returning None for features skipped via
-            emb_skip_threshold or with no vocab info (vs<=0)."""
+            emb_skip_threshold or with no vocab info (vs<=0).
+
+            domain_hash_config: {position: {H, k}} for multi-hash features.
+            """
+            domain_hash_config = domain_hash_config or {}
             embs_raw = []
-            for vs in vocab_sizes:
-                skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
-                if skip:
-                    embs_raw.append(None)
+            is_hash = []
+            for pos, vs in enumerate(vocab_sizes):
+                if pos in domain_hash_config:
+                    embs_raw.append(None)  # handled by multi-hash
+                    is_hash.append(True)
                 else:
-                    embs_raw.append(nn.Embedding(int(vs) + 1, emb_dim))
+                    is_hash.append(False)
+                    skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
+                    if skip:
+                        embs_raw.append(None)
+                    else:
+                        embs_raw.append(nn.Embedding(int(vs) + 1, emb_dim))
             module_list = nn.ModuleList([e for e in embs_raw if e is not None])
             # Map from position index to real index in module_list (-1 if skipped)
             index_map = []
@@ -2595,22 +2594,47 @@ class PCVRHyFormer(nn.Module):
                 else:
                     index_map.append(-1)
             is_id = [int(vs) > seq_id_threshold for vs in vocab_sizes]
-            return module_list, index_map, is_id
+            return module_list, index_map, is_id, is_hash
+
+        # ================== Multi-Hash Seq Embedding Config ==================
+        self.seq_hash_config = seq_hash_config or {}
+        self._seq_hash_embs = nn.ModuleDict()
+        self._seq_hash_emb_index = {}  # {domain: {pos: (start_idx, k)}}
 
         # ================== Dynamic Sequence Embeddings ==================
         self._seq_embs = nn.ModuleDict()
         self._seq_emb_index = {}    # domain -> index_map
         self._seq_is_id = {}        # domain -> is_id list
+        self._seq_is_hash = {}      # domain -> is_hash list
         self._seq_vocab_sizes = {}  # domain -> vocab_sizes list
         self._seq_proj = nn.ModuleDict()
 
         for domain in self.seq_domains:
             vs = seq_vocab_sizes[domain]
-            embs, idx_map, is_id = _make_seq_embs(vs)
+            dhc = self.seq_hash_config.get(domain, {})
+            embs, idx_map, is_id, is_hash = _make_seq_embs(vs, dhc)
             self._seq_embs[domain] = embs
             self._seq_emb_index[domain] = idx_map
             self._seq_is_id[domain] = is_id
+            self._seq_is_hash[domain] = is_hash
             self._seq_vocab_sizes[domain] = vs
+
+            # Build multi-hash embeddings for this domain
+            if dhc:
+                hash_embs = []
+                index = {}
+                for pos, cfg in sorted(dhc.items()):
+                    H, k = cfg['H'], cfg['k']
+                    chunk_dim = emb_dim // k
+                    start = len(hash_embs)
+                    for _ in range(k):
+                        hash_embs.append(nn.Embedding(H, chunk_dim))
+                    index[pos] = (start, k)
+                self._seq_hash_embs[domain] = nn.ModuleList(hash_embs)
+                self._seq_hash_emb_index[domain] = index
+            else:
+                self._seq_hash_embs[domain] = nn.ModuleList()
+                self._seq_hash_emb_index[domain] = {}
             if seq_proj_type == 'senet':
                 self._seq_proj[domain] = SENetProjection(
                     num_features=len(vs),
@@ -2759,14 +2783,26 @@ class PCVRHyFormer(nn.Module):
         skip_count = 0
         reinit_ptrs = set()
 
-        for emb_list, vocab_sizes, emb_index in [
-            (self._seq_embs[d], self._seq_vocab_sizes[d], self._seq_emb_index[d])
-            for d in self.seq_domains
-        ]:
+        for d in self.seq_domains:
+            emb_list = self._seq_embs[d]
+            vocab_sizes = self._seq_vocab_sizes[d]
+            emb_index = self._seq_emb_index[d]
+            is_hash = self._seq_is_hash.get(d, [])
             for i, vs in enumerate(vocab_sizes):
                 real_idx = emb_index[i]
                 if real_idx == -1:
-                    # Skipped by emb_skip_threshold, no embedding to reinit
+                    if is_hash and i < len(is_hash) and is_hash[i]:
+                        if int(vs) > cardinality_threshold:
+                            start, num_k = self._seq_hash_emb_index[d][i]
+                            for j in range(num_k):
+                                emb = self._seq_hash_embs[d][start + j]
+                                nn.init.xavier_normal_(emb.weight.data)
+                                emb.weight.data[0, :] = 0
+                                reinit_ptrs.add(emb.weight.data_ptr())
+                                reinit_count += 1
+                        else:
+                            skip_count += 1
+                    # Either hash (reinit done) or skipped — no regular emb to process
                     continue
                 emb = emb_list[real_idx]
                 if int(vs) > cardinality_threshold:
@@ -2784,6 +2820,17 @@ class PCVRHyFormer(nn.Module):
             for i, (vs, offset, length) in enumerate(specs):
                 real_idx = tokenizer._emb_index[i]
                 if real_idx == -1:
+                    if i in tokenizer._hash_multi and int(vs) > cardinality_threshold:
+                        cfg = tokenizer._hash_multi[i]
+                        start, k = cfg['start'], cfg['k']
+                        for j in range(k):
+                            emb = tokenizer.hash_embs[start + j]
+                            nn.init.xavier_normal_(emb.weight.data)
+                            emb.weight.data[0, :] = 0
+                            reinit_ptrs.add(emb.weight.data_ptr())
+                            reinit_count += 1
+                    else:
+                        skip_count += 1
                     continue
                 emb = tokenizer.embs[real_idx]
                 if int(vs) > cardinality_threshold:
@@ -2850,6 +2897,10 @@ class PCVRHyFormer(nn.Module):
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
         fourier_ts: Optional[torch.Tensor] = None,
+        is_hash: Optional[List[bool]] = None,
+        hash_config: Optional[Dict] = None,
+        hash_embs: Optional[nn.ModuleList] = None,
+        hash_emb_index: Optional[Dict] = None,
     ) -> torch.Tensor:
         """Embeds a sequence domain and projects to d_model.
 
@@ -2868,8 +2919,24 @@ class PCVRHyFormer(nn.Module):
         for i in range(S):
             real_idx = emb_index[i] if i < len(emb_index) else -1
             if real_idx == -1:
-                # Feature skipped by emb_skip_threshold: output zero vector
-                emb_list.append(seq.new_zeros(B, L, self.emb_dim, dtype=self.sparse_dtype))
+                if is_hash and i < len(is_hash) and is_hash[i] and hash_config and i in hash_config:
+                    # Multi-hash embedding
+                    cfg = hash_config[i]
+                    H, k = cfg['H'], cfg['k']
+                    chunk_dim = self.emb_dim // k
+                    start_idx = hash_emb_index[i][0]
+                    vals = seq[:, i, :]  # (B, L)
+                    parts = []
+                    for j in range(k):
+                        emb = hash_embs[start_idx + j]
+                        hash_idx = (_HASH_PRIMES[j] * (i + 1) + vals) % (H - 1) + 1
+                        hash_idx = torch.where(vals == 0, 0, hash_idx)
+                        parts.append(emb(hash_idx))
+                    fid_emb = torch.cat(parts, dim=-1)  # (B, L, emb_dim)
+                else:
+                    # Feature skipped by emb_skip_threshold: output zero vector
+                    fid_emb = seq.new_zeros(B, L, self.emb_dim, dtype=self.sparse_dtype)
+                emb_list.append(fid_emb)
             else:
                 emb = sideinfo_embs[real_idx]
                 e = emb(seq[:, i, :])  # (B, L, emb_dim)
@@ -3012,7 +3079,12 @@ class PCVRHyFormer(nn.Module):
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain],
-                fourier_ts=inputs.seq_timestamps[domain] if self.fourier_seq else None)
+                fourier_ts=inputs.seq_timestamps[domain] if self.fourier_seq else None,
+                is_hash=self._seq_is_hash.get(domain, []),
+                hash_config=self.seq_hash_config.get(domain, {}),
+                hash_embs=self._seq_hash_embs[domain] if domain in self._seq_hash_embs else None,
+                hash_emb_index=self._seq_hash_emb_index.get(domain, {}),
+            )
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -3086,7 +3158,12 @@ class PCVRHyFormer(nn.Module):
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain],
-                fourier_ts=inputs.seq_timestamps[domain] if self.fourier_seq else None)
+                fourier_ts=inputs.seq_timestamps[domain] if self.fourier_seq else None,
+                is_hash=self._seq_is_hash.get(domain, []),
+                hash_config=self.seq_hash_config.get(domain, {}),
+                hash_embs=self._seq_hash_embs[domain] if domain in self._seq_hash_embs else None,
+                hash_emb_index=self._seq_hash_emb_index.get(domain, {}),
+            )
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

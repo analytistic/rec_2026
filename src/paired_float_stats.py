@@ -1,5 +1,3 @@
-from typing import Dict
-
 """Per-fid per-int-value float max statistics from training set.
 
 Used by PairedProcessor to do per-int-value global normalization:
@@ -8,26 +6,6 @@ Used by PairedProcessor to do per-int-value global normalization:
 Keyed by fid -> {int_value: float_max}.
 """
 
-# Frequency + hash embedding config for features with unstable vocab.
-# Each entry: fid → {"top_values": [...], "K": len(top_values), "H": hash_bucket_size}
-# Top K values get direct embedding slots; remaining values go through hash.
-FREQ_HASH_CONFIG: Dict[int, dict] = {
-    7: {
-        "top_values": [1244, 2160, 2414, 440, 1235, 1985, 1639, 2370, 1306, 56,
-                       955, 2305, 471, 2217, 434, 1727, 711, 752, 403, 2092],
-        "K": 20, "H": 512,
-    },
-    12: {
-        "top_values": [1844, 1454, 883, 930, 1911, 1340, 1179, 1712, 2235, 1484,
-                       971, 36, 881, 244, 575, 525, 71, 593, 2026, 1212],
-        "K": 20, "H": 512,
-    },
-    8: {
-        "top_values": [2000, 190, 1153, 401, 992, 1057, 1255, 1491, 868, 383,
-                       846, 1457, 1559, 437, 501, 208, 1962, 959, 1129, 808],
-        "K": 20, "H": 512,
-    },
-}
 
 PAIRED_FLOAT_MAX_BY_INT = {
     62: {1: 231542.0, 2: 47079632.0, 3: 5234925.0, 4: 69970032.0, 5: 124401.0, 6: 123510024.0, 7: 5998.0, 8: 4073158.0, 9: 271811520.0, 10: 20404520.0},

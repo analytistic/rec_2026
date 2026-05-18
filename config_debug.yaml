@@ -58,6 +58,10 @@ seq_ffn_config: {}
 
 seq_proj_type: linear
 
+seq_hash_embedding:
+  seq_b: {69: {H: 512, k: 4}}
+  seq_c: {29: {H: 512, k: 4}, 34: {H: 512, k: 4}, 47: {H: 512, k: 4}}
+
 use_time_buckets: true
 fourier_seq: false
 fourier_ns: false
@@ -66,11 +70,11 @@ add_seq_time_attrs: true
 use_domain_emb: true
 
 hash_embedding:
-  7: 512
-  8: 512
-  12: 512
-  16: 4096
-  54: 512
+  7: {H: 512, k: 4}
+  8: {H: 512, k: 4}
+  12: {H: 512, k: 4}
+  16: {H: 512, k: 4}
+  54: {H: 512, k: 4}
 
 loss_type: bce
 focal_alpha: 0.1

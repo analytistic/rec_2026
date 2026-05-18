@@ -24,7 +24,7 @@ from .utils import set_seed, EarlyStopping, create_logger
 from .dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
 from .model import PCVRHyFormer
 from .trainer import PCVRHyFormerRankingTrainer
-from .paired_float_stats import FREQ_HASH_CONFIG
+
 
 
 _DTYPE_MAP = {
@@ -175,29 +175,44 @@ def main() -> None:
     raw_hash = cfg.get('hash_embedding', {})
     item_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.item_int_schema.entries)}
     item_hash_config = {}
-    for fid, H in raw_hash.items():
+    for fid, hcfg in raw_hash.items():
         if fid not in item_fid_to_idx:
             logging.warning(f"hash_embedding fid {fid} not found in item_int_schema, skipping")
             continue
-        if fid in FREQ_HASH_CONFIG:
-            item_hash_config[item_fid_to_idx[fid]] = FREQ_HASH_CONFIG[fid]
-        else:
-            item_hash_config[item_fid_to_idx[fid]] = H
+        item_hash_config[item_fid_to_idx[fid]] = hcfg
     if item_hash_config:
         logging.info(f"Item hash config: {item_hash_config}")
 
     # ---- Hash embedding config for user features ----
     user_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.user_int_schema.entries)}
     user_hash_config = {}
-    for fid, H in raw_hash.items():
+    for fid, hcfg in raw_hash.items():
         if fid not in user_fid_to_idx:
             continue
-        if fid in FREQ_HASH_CONFIG:
-            user_hash_config[user_fid_to_idx[fid]] = FREQ_HASH_CONFIG[fid]
-        else:
-            user_hash_config[user_fid_to_idx[fid]] = H
+        user_hash_config[user_fid_to_idx[fid]] = hcfg
     if user_hash_config:
         logging.info(f"User hash config: {user_hash_config}")
+
+    # ---- Seq hash embedding config: convert fid → sideinfo position index ----
+    raw_seq_hash = cfg.get('seq_hash_embedding', {})
+    seq_hash_config = {}
+    for domain, fids_cfg in raw_seq_hash.items():
+        if domain not in pcvr_dataset.seq_domains:
+            logging.warning(f"seq_hash_embedding: unknown domain {domain}, skipping")
+            continue
+        sideinfo = pcvr_dataset.sideinfo_fids.get(domain, [])
+        domain_cfg = {}
+        for fid, hcfg in fids_cfg.items():
+            if fid not in sideinfo:
+                logging.warning(f"seq_hash_embedding: fid {fid} not in {domain} sideinfo, skipping")
+                continue
+            pos = sideinfo.index(fid)
+            domain_cfg[pos] = hcfg
+        if domain_cfg:
+            logging.info(f"Seq hash config for {domain}: {domain_cfg}")
+            seq_hash_config[domain] = domain_cfg
+    if seq_hash_config:
+        logging.info(f"Seq hash config: {seq_hash_config}")
 
     # ---- Build model ----
     user_int_feature_specs = build_feature_specs(
@@ -220,6 +235,7 @@ def main() -> None:
         "user_hash_config": user_hash_config,
         "paired_feature_specs": paired_feature_specs,
         "paired_fids": paired_fids,
+        "seq_hash_config": seq_hash_config,
         "d_model": cfg['d_model'],
         "emb_dim": cfg['emb_dim'],
         "num_queries": cfg['num_queries'],
@@ -270,6 +286,43 @@ def main() -> None:
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())
     logging.info(f"Total parameters: {total_params:,}")
+
+    # ---- Vocab info ----
+    def _print_vocab_info():
+        lines = []
+        for name, tokenizer, schema in [
+            ("User", model.user_ns_tokenizer, pcvr_dataset.user_int_schema),
+            ("Item", model.item_ns_tokenizer, pcvr_dataset.item_int_schema),
+        ]:
+            lines.append(f"\n  [{name} features]")
+            for fid_idx, (vs, offset, length) in enumerate(tokenizer.feature_specs):
+                fid = schema.entries[fid_idx][0]
+                eidx = tokenizer._emb_index[fid_idx]
+                if fid_idx in tokenizer._hash_multi:
+                    cfg = tokenizer._hash_multi[fid_idx]
+                    lines.append(f"    fid={fid}: vocab={vs:>9,}  HASH(H={cfg['H']}, k={cfg['k']})")
+                elif eidx == -1:
+                    thr = cfg.get('emb_skip_threshold', '?')
+                    lines.append(f"    fid={fid}: vocab={vs:>9,}  SKIP(>{thr})")
+                else:
+                    lines.append(f"    fid={fid}: vocab={vs:>9,}  embed")
+        lines.append("\n  [Seq features]")
+        for domain in model.seq_domains:
+            vs_list = pcvr_dataset.seq_domain_vocab_sizes[domain]
+            sideinfo = pcvr_dataset.sideinfo_fids.get(domain, [])
+            lines.append(f"    {domain}:")
+            for i, (fid, vs) in enumerate(zip(sideinfo, vs_list)):
+                eidx = model._seq_emb_index[domain][i]
+                is_hash = model._seq_is_hash.get(domain, [False] * len(vs_list))[i] if i < len(model._seq_is_hash.get(domain, [])) else False
+                if is_hash:
+                    dhc = model.seq_hash_config.get(domain, {}).get(i, {})
+                    lines.append(f"      fid={fid}: vocab={vs:>9,}  HASH(H={dhc.get('H', '?')}, k={dhc.get('k', '?')})")
+                elif eidx == -1:
+                    lines.append(f"      fid={fid}: vocab={vs:>9,}  SKIP(>1M)")
+                else:
+                    lines.append(f"      fid={fid}: vocab={vs:>9,}  embed")
+        return '\n'.join(lines)
+    logging.info(f"Vocab info:\n{_print_vocab_info()}")
 
     # ---- Training ----
     early_stopping = EarlyStopping(
