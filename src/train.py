@@ -299,8 +299,8 @@ def main() -> None:
                 fid = schema.entries[fid_idx][0]
                 eidx = tokenizer._emb_index[fid_idx]
                 if fid_idx in tokenizer._hash_multi:
-                    cfg = tokenizer._hash_multi[fid_idx]
-                    lines.append(f"    fid={fid}: vocab={vs:>9,}  HASH(H={cfg['H']}, k={cfg['k']})")
+                    hcfg = tokenizer._hash_multi[fid_idx]
+                    lines.append(f"    fid={fid}: vocab={vs:>9,}  HASH(H={hcfg['H']}, k={hcfg['k']})")
                 elif eidx == -1:
                     thr = cfg.get('emb_skip_threshold', '?')
                     lines.append(f"    fid={fid}: vocab={vs:>9,}  SKIP(>{thr})")

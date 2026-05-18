@@ -118,6 +118,23 @@ def _parse_seq_max_lens(sml_str: str) -> Dict[str, int]:
     return seq_max_lens
 
 
+def _fix_json_int_keys(d: Any) -> Any:
+    """Recursively convert string keys that look like integers back to int.
+
+    JSON serializes all dict keys as strings, so ``{7: ...}`` round-trips
+    through ``json.dump`` → ``json.load`` as ``{"7": ...}``. This function
+    walks the loaded structure and fixes dict keys that represent integers.
+    """
+    if isinstance(d, dict):
+        return {
+            int(k) if isinstance(k, str) and k.lstrip('-').isdigit() else k: _fix_json_int_keys(v)
+            for k, v in d.items()
+        }
+    if isinstance(d, list):
+        return [_fix_json_int_keys(v) for v in d]
+    return d
+
+
 def load_train_config(model_dir: str) -> Dict[str, Any]:
     """Load ``train_config.json`` from the ckpt directory.
 
@@ -128,6 +145,7 @@ def load_train_config(model_dir: str) -> Dict[str, Any]:
     if os.path.exists(train_config_path):
         with open(train_config_path, 'r') as f:
             cfg = json.load(f)
+        cfg = _fix_json_int_keys(cfg)
         logging.info(f"Loaded train_config from {train_config_path}")
         return cfg
     logging.warning(
