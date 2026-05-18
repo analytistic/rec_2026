@@ -70,11 +70,7 @@ add_seq_time_attrs: true
 use_domain_emb: true
 
 hash_embedding:
-  7: {H: 512, k: 4}
-  8: {H: 512, k: 4}
-  12: {H: 512, k: 4}
   16: {H: 512, k: 4}
-  54: {H: 512, k: 4}
 
 loss_type: bce
 focal_alpha: 0.1
