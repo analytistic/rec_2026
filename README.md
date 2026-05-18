@@ -70,18 +70,20 @@ Row time 作为独立的 NS token（排在 item_ns 之后），避免被 user/it
 - **Row time 独立 NS token**：之前时间特征混在 user int 特征里一起经 tokenizer，信号被稀释；独立 token 后 eval 持平、test 提升，说明时间信号得到了有效利用。
 - **is_workday × segment 分桶**：解决 train/test 时间分布不一致问题，test 提升。
 
+最后AUC: 0.822
+
 ## Multi-Hash Embedding
 
 ### 背景
 
 Item int 特征的 train/test 分布存在严重偏移：
 
-| FID | Train _other | Test _other | 问题 |
-|-----|-------------|-------------|------|
-| 7 | 78.7% | 73.9% | 长尾极大，test top rank 漂移 |
-| 8 | 75.5% | 68.2% | 大量 test-only novel 值 |
-| 12 | 78.7% | 73.9% | 同 f7，高度相关 |
-| 16 | 91.8% | 88.4% | 最稀疏，train/test top-5 完全无重叠 |
+| FID | Train _other | Test _other | 问题                                |
+| --- | ------------ | ----------- | ----------------------------------- |
+| 7   | 78.7%        | 73.9%       | 长尾极大，test top rank 漂移        |
+| 8   | 75.5%        | 68.2%       | 大量 test-only novel 值             |
+| 12  | 78.7%        | 73.9%       | 同 f7，高度相关                     |
+| 16  | 91.8%        | 88.4%       | 最稀疏，train/test top-5 完全无重叠 |
 
 这些特征原始值域很大，但经过 mod 编码压缩到 21 个取值，碰撞严重，标准 Embedding(21, emb_dim) 无法区分碰撞到同一桶的不同 ID。Seq 侧也存在 vocab 极大的特征（seq_c/f47: 86.3M、f29: 5.8M），直接建 Embedding 不现实。
 
@@ -98,14 +100,29 @@ hash_idx_j = 0 if val == 0   # padding
 
 ### 选定特征
 
-**Item NS**（mod 21 碰撞严重）：f7/H=256/k=4, f8/256/4, f12/256/4, f16/512/4（最严重）
-**User NS**：f54/256/4（多值特征）
-**Seq**（vocab 过大）：seq_b/f69/512/4(64.7M), seq_c/f29/512/4(5.8M), f34/512/4(1.0M), f36/512/4, f47/512/4(86.3M), seq_a/f38/512/4, seq_d/f23/512/4
-
-### JSON int key 修复
-
-`json.dump` 将 int key 序列化为 string，`load_train_config` 加载后 `hash_embedding` 的 key 变为 `"7"` 而非 `7`，导致 `build_model` 中全部跳过。新增 `_fix_json_int_keys` 递归修复。
+**Item NS**（mod 21 碰撞最严重）：f16/512/4
+**Seq**（vocab 过大，会被 emb_skip_threshold=1M 跳过）：seq_b/f69/512/4(64.7M), seq_c/f29/512/4(5.8M), f34/512/4(1.0M), f47/512/4(86.3M)
 
 ### 效果
 
-infer 正确加载 hash 后 test AUC **0.829**。
+infer 正确加载 hash 后 test AUC 0.824→**0.829**。
+
+## Paired Int+Float Processor
+
+### 背景
+
+User 侧 f62-66（int+float 配对）和 f89-91（定长 10 的配对特征）同时提供类别 ID 和对应统计量。int 仅 21 个取值（f62 仅 10 个），但 float 分布极丰富（f66 有 1,389 种 int-float 组合）。简单做法是把 int 作为普通特征 embedding，float 作为 dense 特征拼入，两者关联信息丢失。
+
+### 方案
+
+`PairedProcessor`：每个 paired fid 独立处理，多槽位 int 值经 Embedding 后以 log1p(float_val) 为权重做加权求和，输出一个 emb_dim 向量，最后 concat 所有 fid 的向量投影为一个 d_model token。
+
+两类 float 不同处理：
+- **Count 型**（f62-66 的 count/sum/duration）：weight = log1p(float) / log1p(global_max[int])，用该 int 值在全局中的最大 float 归一化
+- **Score 型**（f89-91 的匹配度得分）：weight = float，原始得分直接作为权重
+
+同时将 paired int 从 user int 特征中分离，不再经过 NS tokenizer，避免 int+float 关联信息被 group embedding 平均池化稀释。
+
+### 效果
+
+同时配合 padding 修正，test AUC 0.822→0.824（paired processor 单独收益无法量化）。
