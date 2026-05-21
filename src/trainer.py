@@ -459,6 +459,8 @@ class PCVRHyFormerRankingTrainer:
         seq_lens: Dict[str, torch.Tensor] = {}
         seq_time_buckets: Dict[str, torch.Tensor] = {}
         seq_timestamps: Dict[str, torch.Tensor] = {}
+        seq_session_ids: Dict[str, torch.Tensor] = {}
+        seq_sess_event_masks: Dict[str, torch.Tensor] = {}
         for domain in seq_domains:
             seq_data[domain] = device_batch[domain]
             seq_lens[domain] = device_batch[f'{domain}_len']
@@ -470,6 +472,12 @@ class PCVRHyFormerRankingTrainer:
             seq_timestamps[domain] = device_batch.get(
                 f'{domain}_timestamp',
                 torch.zeros(B, L, dtype=torch.long, device=self.device))
+            seq_session_ids[domain] = device_batch.get(
+                f'{domain}_session_ids',
+                torch.zeros(B, L, dtype=torch.long, device=self.device))
+            sess_mask = device_batch.get(f'{domain}_sess_event_mask')
+            if sess_mask is not None:
+                seq_sess_event_masks[domain] = sess_mask
 
         timestamp = device_batch.get('timestamp', torch.zeros(B, dtype=torch.long, device=self.device))
 
@@ -492,6 +500,8 @@ class PCVRHyFormerRankingTrainer:
             hour=hour,
             dow=dow,
             weekend=weekend,
+            seq_session_ids=seq_session_ids,
+            seq_sess_event_masks=seq_sess_event_masks,
         )
 
     def _training_step(self, batch: Dict[str, Any], step: int, epoch: int = 0) -> float:

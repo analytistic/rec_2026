@@ -64,7 +64,7 @@ rank_mixer_mode: full
 # For features with unstable vocab across train/test, use multi-hash embedding.
 # Key = fid, value = {H: hash_bucket_size, k: num_hash_functions}. Omitted fids use standard Embedding.
 hash_embedding:
-  16: {H: 512, k: 4}
+  16: {H: 2048, k: 4}
 
 # ─── FFN ─────────────────────────────────────────────────────────────────────
 ffn_name: shared
@@ -75,8 +75,8 @@ seq_ffn_config: {}
 
 # ─── Seq Hash Embedding ──────────────────────────────────────────────────────
 seq_hash_embedding:
-  seq_b: {69: {H: 512, k: 4}}
-  seq_c: {29: {H: 512, k: 4}, 34: {H: 512, k: 4}, 47: {H: 512, k: 4}}
+  seq_b: {69: {H: 20480, k: 4}}
+  seq_c: {29: {H: 20480, k: 4}, 34: {H: 20480, k: 4}, 47: {H: 20480, k: 4}}
 # ─── Sequence projection ─────────────────────────────────────────────────────
 seq_proj_type: linear
 
@@ -86,6 +86,10 @@ fourier_seq: false
 fourier_ns: false
 use_row_time_ns: true
 add_seq_time_attrs: true
+
+# ─── Session-aware DIN ──────────────────────────────────────────────────────
+session_thresholds: {seq_a: 3600, seq_b: 3600, seq_c: 86400, seq_d: 3600}
+max_sessions: 20
 
 # ─── Domain Embedding ─────────────────────────────────────────────────────────
 use_domain_emb: true
