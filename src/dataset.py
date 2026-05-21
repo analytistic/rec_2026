@@ -11,7 +11,7 @@ Optimizations:
   when using many DataLoader workers.
 """
 
-PAIRED_FIDS = frozenset({62, 63, 64, 65, 66, 89, 90, 91})
+PAIRED_FIDS = frozenset({62, 63, 64, 65, 66})
 
 import os
 import logging
