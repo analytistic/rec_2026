@@ -1839,9 +1839,10 @@ class GroupNSTokenizer(nn.Module):
         Returns:
             Tokens of shape (B, num_groups, D).
         """
-        tokens = []
+        # Embed all fids across all groups, collect for global pool
+        group_cats = []
         all_fid_embs = []
-        for group, proj in zip(self.groups, self.group_projs):
+        for group in self.groups:
             fid_embs = []
             for fid_idx in group:
                 vs, offset, length = self.feature_specs[fid_idx]
@@ -1860,11 +1861,17 @@ class GroupNSTokenizer(nn.Module):
                         fid_emb = (emb_all * mask).sum(dim=1) / count
                 fid_embs.append(fid_emb)
                 all_fid_embs.append(fid_emb)
-            cat_emb = torch.cat(fid_embs, dim=-1)
+            group_cats.append(torch.cat(fid_embs, dim=-1))  # (B, len(group)*emb_dim)
+
+        # Project N-1 groups, then append global token
+        tokens = []
+        for cat_emb, proj in zip(group_cats[:-1], self.group_projs[:-1]):
             tokens.append(F.silu(proj(cat_emb.to(proj[0].weight.dtype))).unsqueeze(1))
-        global_emb = torch.stack(all_fid_embs, dim=0).mean(dim=0)  # (B, emb_dim)
-        global_token = self.global_mlp(global_emb).unsqueeze(1)  # (B, 1, d_model)
-        return torch.cat(tokens, dim=1), global_token
+
+        global_emb = torch.stack(all_fid_embs, dim=0).mean(dim=0)
+        global_token = self.global_mlp(global_emb).unsqueeze(1)
+        tokens.append(global_token)
+        return torch.cat(tokens, dim=1)
 
 
 class RankMixerNSTokenizer(nn.Module):
@@ -2019,23 +2026,24 @@ class RankMixerNSTokenizer(nn.Module):
                         )
                 all_embs.append(fid_emb)
 
-        # Global token: mean pool all raw embeddings → MLP
-        global_emb = torch.stack(all_embs, dim=0).mean(dim=0)  # (B, emb_dim)
-        global_token = self.global_mlp(global_emb).unsqueeze(1)  # (B, 1, d_model)
-
         cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
 
         # 2. Pad if needed
         if self._pad_size > 0:
             cat_emb = F.pad(cat_emb, (0, self._pad_size))  # (B, padded_total_dim)
 
-        # 3. Split into num_ns_tokens chunks and project each
+        # 3. Split into num_ns_tokens-1 chunks, project, then append global token
         chunks = cat_emb.split(self.chunk_dim, dim=-1)  # list of (B, chunk_dim)
         tokens = []
-        for chunk, proj in zip(chunks, self.token_projs):
+        for chunk, proj in zip(chunks[:-1], self.token_projs[:-1]):
             tokens.append(F.silu(proj(chunk.to(proj[0].weight.dtype))).unsqueeze(1))  # (B, 1, d_model)
 
-        return torch.cat(tokens, dim=1), global_token  # (B, num_ns_tokens, d_model), (B, 1, d_model)
+        # Global token: mean pool all raw embeddings → MLP
+        global_emb = torch.stack(all_embs, dim=0).mean(dim=0)  # (B, emb_dim)
+        global_token = self.global_mlp(global_emb).unsqueeze(1)  # (B, 1, d_model)
+        tokens.append(global_token)
+
+        return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
 class SENetProjection(nn.Module):
@@ -2214,29 +2222,27 @@ class AutoNSTokenizer(nn.Module):
                 all_embs.append(f)
         X = torch.stack(all_embs, dim=1)  # (B, n_f, emb_dim)
 
-        # Global token: mean pool all feature embeddings → MLP
-        global_token = self.global_mlp(X.mean(dim=1)).unsqueeze(1)  # (B, 1, d_model)
-
-        # Top-k grouping: each group selects its k features
-   
+        # Top-k grouping: produce num_groups-1 groups, then append global token
         topk_weights = F.softmax(self.W, dim=-1)  # (n_g, n_f)
         topk_scores, topk_idx = torch.topk(topk_weights, self.k, dim=-1)  # (n_g, k)
 
-        # Gather k features per group
+        # Gather k features per group (all groups computed, drop the last)
         idx = topk_idx.unsqueeze(0).unsqueeze(-1).expand(B, -1, -1, self.emb_dim)
         X_exp = X.unsqueeze(1).expand(-1, self.num_groups, -1, -1)
         grouped = torch.gather(X_exp, 2, idx)  # (B, n_g, k, emb_dim)
 
-        # Scale + concat → project → SiLU
-        topk_scores = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-8)  # Normalize scores
-        w = topk_scores.unsqueeze(0).unsqueeze(-1)  # (1, n_g, k, 1)
-        out = (grouped * w).reshape(B, self.num_groups, -1)  # (B, n_g, k*emb_dim)
+        # Scale + concat → project → SiLU (N-1 groups)
+        topk_scores = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-8)
+        w = topk_scores.unsqueeze(0).unsqueeze(-1)
+        out = (grouped * w).reshape(B, self.num_groups, -1)
         tokens = []
-        for i in range(self.num_groups):
-            tokens.append(F.silu(self.token_projs[i](out[:, i, :].to(self.token_projs[i][0].weight.dtype))).unsqueeze(1))  # (B, 1, d_model)
+        for i in range(self.num_groups - 1):
+            tokens.append(F.silu(self.token_projs[i](out[:, i, :].to(self.token_projs[i][0].weight.dtype))).unsqueeze(1))
 
-
-        return torch.cat(tokens, dim=1), global_token  # (B, n_g, d_model), (B, 1, d_model)
+        # Global token: mean pool all feature embeddings → MLP
+        global_token = self.global_mlp(X.mean(dim=1)).unsqueeze(1)
+        tokens.append(global_token)
+        return torch.cat(tokens, dim=1)  # (B, n_g, d_model)
 
 
 class PairedProcessor(nn.Module):
@@ -2563,10 +2569,6 @@ class PCVRHyFormer(nn.Module):
             )
         num_paired = len(paired_feature_specs)
         num_paired_tokens = 1 if self.has_paired else 0
-
-        # Global token for user and item (one extra token each)
-        num_user_ns += 1
-        num_item_ns += 1
 
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0) + num_paired_tokens
@@ -3065,20 +3067,14 @@ class PCVRHyFormer(nn.Module):
         # 1. NS tokens: grouped projection
         user_int_feats = inputs.user_int_feats
 
-        user_ns, user_global = self.user_ns_tokenizer(user_int_feats)
-        user_ns = user_ns.to(self.dense_dtype)
-        user_global = user_global.to(self.dense_dtype)
-        item_ns, item_global = self.item_ns_tokenizer(inputs.item_int_feats)
-        item_ns = item_ns.to(self.dense_dtype)
-        item_global = item_global.to(self.dense_dtype)
+        user_ns = self.user_ns_tokenizer(user_int_feats).to(self.dense_dtype)
+        item_ns = self.item_ns_tokenizer(inputs.item_int_feats).to(self.dense_dtype)
 
         if self.use_domain_emb:
             user_ns = user_ns + self.user_domain_emb
-            user_global = user_global + self.user_domain_emb
             item_ns = item_ns + self.item_domain_emb
-            item_global = item_global + self.item_domain_emb
 
-        ns_parts = [user_ns, user_global]
+        ns_parts = [user_ns]
         if self.has_user_dense:
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats.to(self.dense_dtype))).unsqueeze(1)  # (B, 1, D)
             if self.use_domain_emb:
@@ -3090,7 +3086,6 @@ class PCVRHyFormer(nn.Module):
                 paired_tokens = paired_tokens + self.user_domain_emb
             ns_parts.append(paired_tokens)
         ns_parts.append(item_ns)
-        ns_parts.append(item_global)
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats.to(self.dense_dtype))).unsqueeze(1)  # (B, 1, D)
             if self.use_domain_emb:
@@ -3153,20 +3148,14 @@ class PCVRHyFormer(nn.Module):
         """Runs inference without dropout, returning logits, embeddings and ns_tokens."""
         user_int_feats = inputs.user_int_feats
 
-        user_ns, user_global = self.user_ns_tokenizer(user_int_feats)
-        user_ns = user_ns.to(self.dense_dtype)
-        user_global = user_global.to(self.dense_dtype)
-        item_ns, item_global = self.item_ns_tokenizer(inputs.item_int_feats)
-        item_ns = item_ns.to(self.dense_dtype)
-        item_global = item_global.to(self.dense_dtype)
+        user_ns = self.user_ns_tokenizer(user_int_feats).to(self.dense_dtype)
+        item_ns = self.item_ns_tokenizer(inputs.item_int_feats).to(self.dense_dtype)
 
         if self.use_domain_emb:
             user_ns = user_ns + self.user_domain_emb
-            user_global = user_global + self.user_domain_emb
             item_ns = item_ns + self.item_domain_emb
-            item_global = item_global + self.item_domain_emb
 
-        ns_parts = [user_ns, user_global]
+        ns_parts = [user_ns]
         if self.has_user_dense:
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats.to(self.dense_dtype))).unsqueeze(1)
             if self.use_domain_emb:
@@ -3178,7 +3167,6 @@ class PCVRHyFormer(nn.Module):
                 paired_tokens = paired_tokens + self.user_domain_emb
             ns_parts.append(paired_tokens)
         ns_parts.append(item_ns)
-        ns_parts.append(item_global)
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats.to(self.dense_dtype))).unsqueeze(1)
             if self.use_domain_emb:
