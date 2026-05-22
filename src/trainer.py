@@ -11,7 +11,7 @@ import shutil
 import time
 import logging
 import contextlib
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -548,6 +548,29 @@ class PCVRHyFormerRankingTrainer:
         n_valid_batches = len(self.valid_loader)
         eval_start = time.time()
 
+        # Register hooks on each block to collect q+ns tokens for erank
+        block_erank_sums: List[float] = [0.0 for _ in range(len(self.model.blocks))]
+        block_erank_counts: List[int] = [0 for _ in range(len(self.model.blocks))]
+        hooks = []
+        if self.writer is not None:
+            for i, block in enumerate(self.model.blocks):
+                def make_hook(i):
+                    def hook(module, inp, out):
+                        parts = list(out.q_tokens_list) + [out.ns_tokens]
+                        combined = torch.cat(parts, dim=1)  # (B, T, D)
+                        er_sum = 0.0
+                        for b in range(combined.shape[0]):
+                            X = combined[b]                 # (T, D)
+                            X = X - X.mean(dim=0, keepdim=True)
+                            S = torch.linalg.svdvals(X)     # (k,), k = min(T, D)
+                            p = S / (S.sum() + 1e-10)
+                            ent = -(p * torch.log(p + 1e-10)).sum()
+                            er_sum += torch.exp(ent).item()
+                        block_erank_sums[i] += er_sum / combined.shape[0]
+                        block_erank_counts[i] += 1
+                    return hook
+                hooks.append(block.register_forward_hook(make_hook(i)))
+
         with torch.no_grad():
             for step, batch in enumerate(self.valid_loader):
                 logits, labels, ns_tokens = self._evaluate_step(batch, return_ns=self.writer is not None)
@@ -558,6 +581,9 @@ class PCVRHyFormerRankingTrainer:
                 if self.log_step > 0 and (step + 1) % self.log_step == 0:
                     logging.info(f"Valid batch {step + 1}/{n_valid_batches}, "
                                  f"elapsed: {time.time() - eval_start:.0f}s")
+
+        for h in hooks:
+            h.remove()
 
         all_logits = torch.cat(all_logits_list, dim=0).float()  # fp32 for sigmoid/AUC/logloss
         all_labels = torch.cat(all_labels_list, dim=0).long()
@@ -595,6 +621,18 @@ class PCVRHyFormerRankingTrainer:
                 self._log_effective_rank(ns_tokens, epoch)
             except Exception as e:
                 logging.warning(f"Effective rank computation failed: {e}")
+
+        # Per-block effective rank (average across batches)
+        if self.writer is not None and any(c > 0 for c in block_erank_counts):
+            try:
+                for i, (s, c) in enumerate(zip(block_erank_sums, block_erank_counts)):
+                    if c == 0:
+                        continue
+                    avg_er = s / c
+                    self.writer.add_scalar(f'EffectiveRank/block_{i}', avg_er, epoch)
+                    logging.info(f"  Block {i} avg effective rank: {avg_er:.2f}")
+            except Exception as e:
+                logging.warning(f"Block effective rank computation failed: {e}")
 
         return auc, logloss
 
