@@ -556,11 +556,7 @@ class PCVRHyFormerRankingTrainer:
             for i, block in enumerate(self.model.blocks):
                 def make_hook(i):
                     def hook(module, inp, out):
-                        if hasattr(out, 'q_tokens_list'):
-                            parts = list(out.q_tokens_list) + [out.ns_tokens]
-                        else:
-                            # Legacy block returns (q_tokens_list, ns_tokens, ...)
-                            parts = list(out[0]) + [out[1]]
+                        parts = list(out.q_tokens_list) + [out.ns_tokens]
                         combined = torch.cat(parts, dim=1)  # (B, T, D)
                         er_sum = 0.0
                         for b in range(combined.shape[0]):
@@ -633,8 +629,7 @@ class PCVRHyFormerRankingTrainer:
                     if c == 0:
                         continue
                     avg_er = s / c
-                    tag = f'EffectiveRank/block_{i}'
-                    self.writer.add_scalar(tag, avg_er, epoch)
+                    self.writer.add_scalar(f'EffectiveRank/block_{i}', avg_er, epoch)
                     logging.info(f"  Block {i} avg effective rank: {avg_er:.2f}")
             except Exception as e:
                 logging.warning(f"Block effective rank computation failed: {e}")
