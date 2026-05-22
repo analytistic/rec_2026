@@ -509,6 +509,21 @@ def main() -> None:
 
     logging.info(f"Inference complete: {len(all_probs)} predictions")
 
+    # ---- Prediction distribution diagnostics ----
+    probs_arr = np.array(all_probs, dtype=np.float64)
+    eps = 1e-12
+    ent = -probs_arr * np.log(np.clip(probs_arr, eps, 1)) - (1 - probs_arr) * np.log(np.clip(1 - probs_arr, eps, 1))
+    logging.info(f"Prediction stats: mean={probs_arr.mean():.6f}, std={probs_arr.std():.6f}, "
+                 f"min={probs_arr.min():.6f}, max={probs_arr.max():.6f}")
+    logging.info(f"Prediction percentiles: P50={np.median(probs_arr):.6f}, "
+                 f"P90={np.percentile(probs_arr, 90):.6f}, P99={np.percentile(probs_arr, 99):.6f}")
+    logging.info(f"Avg entropy: {ent.mean():.6f} (random=0.693, perfect=0.000)")
+
+    pos = (probs_arr > 0.5).sum()
+    neg = (probs_arr <= 0.5).sum()
+    logging.info(f"Predicted positive (>0.5): {pos}/{len(probs_arr)} ({100*pos/len(probs_arr):.2f}%)")
+    logging.info(f"Predicted negative (<=0.5): {neg}/{len(probs_arr)} ({100*neg/len(probs_arr):.2f}%)")
+
     predictions = {
         "predictions": dict(zip(all_user_ids, all_probs)),
     }
