@@ -310,12 +310,6 @@ class PCVRHyFormerRankingTrainer:
         total_steps = steps_in_epoch * self.num_epochs
         interval_sum = 0.0
 
-        # Evaluate before training starts (epoch 0)
-        logging.info("Pre-training evaluation (epoch 0)...")
-        val_auc_0, val_logloss_0 = self.evaluate(epoch=0)
-        logging.info(f"Epoch 0 Validation | AUC: {val_auc_0}, LogLoss: {val_logloss_0}")
-        self.model.train()
-
         for epoch in range(1, self.num_epochs + 1):
             loss_sum = 0.0
             epoch_start = time.time()
