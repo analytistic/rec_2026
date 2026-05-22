@@ -1893,6 +1893,7 @@ class RankMixerNSTokenizer(nn.Module):
         emb_skip_threshold: int = 0,
         norm_type: str = 'layer',
         hash_config: Optional[Dict[int, Any]] = None,
+        shuffle: bool = False,
     ) -> None:
         """Initializes RankMixerNSTokenizer.
 
@@ -1912,6 +1913,7 @@ class RankMixerNSTokenizer(nn.Module):
         self.emb_dim = emb_dim
         self.num_ns_tokens = num_ns_tokens
         self.emb_skip_threshold = emb_skip_threshold
+        self.shuffle = shuffle
         self.hash_config = hash_config or {}
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
@@ -2028,7 +2030,7 @@ class RankMixerNSTokenizer(nn.Module):
                 all_embs.append(fid_emb)
 
         # Shuffle fid order before concat during training (batch-level permutation)
-        if self.training:
+        if self.shuffle and self.training:
             idx = torch.randperm(len(all_embs), device=all_embs[0].device)
             all_embs = [all_embs[i] for i in idx]
 
@@ -2398,6 +2400,8 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Shuffle fid order before concat during training
+        shuffle_ns: bool = True,
         # Dtype control
         dense_dtype: torch.dtype = torch.float32,
         sparse_dtype: torch.dtype = torch.float32,
@@ -2497,6 +2501,7 @@ class PCVRHyFormer(nn.Module):
                 emb_skip_threshold=emb_skip_threshold,
                 norm_type=norm_type,
                 hash_config=user_hash_config,
+                shuffle=shuffle_ns,
             )
             num_user_ns = user_ns_tokens
 
@@ -2509,6 +2514,7 @@ class PCVRHyFormer(nn.Module):
                 emb_skip_threshold=emb_skip_threshold,
                 norm_type=norm_type,
                 hash_config=item_hash_config,
+                shuffle=shuffle_ns,
             )
             num_item_ns = item_ns_tokens
         elif ns_tokenizer_type == 'auto':

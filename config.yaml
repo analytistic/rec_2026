@@ -57,6 +57,7 @@ seq_id_threshold: 100
 ns_tokenizer_type: rankmixer
 user_ns_tokens: 8
 item_ns_tokens: 3
+shuffle_ns: true
 ns_groups_json: ""
 rank_mixer_mode: full
 
