@@ -269,6 +269,7 @@ def main() -> None:
         "use_row_time_ns": cfg['use_row_time_ns'],
         "use_domain_emb": cfg.get('use_domain_emb', False),
         "shuffle_ns": cfg.get('shuffle_ns', True),
+        "num_moe_experts": cfg.get('num_moe_experts', 1),
         "seq_proj_type": cfg['seq_proj_type'],
         "seq_ffn_name": cfg['seq_ffn_name'],
         "seq_ffn_config": cfg['seq_ffn_config'],

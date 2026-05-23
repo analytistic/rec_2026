@@ -2054,6 +2054,57 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class MoERankMixerNSTokenizer(nn.Module):
+    """MoE version of RankMixerNSTokenizer — K independent experts, concat on dim=-1.
+
+    Each expert uses emb_dim//K and d_model//K. Total parameters unchanged.
+    Output: (B, num_ns_tokens, d_model).
+    """
+
+    def __init__(
+        self,
+        num_experts: int = 1,
+        *,
+        feature_specs: List[Tuple[int, int, int]],
+        groups: List[List[int]],
+        emb_dim: int,
+        d_model: int,
+        num_ns_tokens: int,
+        emb_skip_threshold: int = 0,
+        norm_type: str = 'layer',
+        hash_config: Optional[Dict[int, Any]] = None,
+        shuffle: bool = False,
+    ) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+        if d_model % num_experts != 0:
+            raise ValueError(f"d_model={d_model} must be divisible by num_experts={num_experts}")
+        if emb_dim % num_experts != 0:
+            raise ValueError(f"emb_dim={emb_dim} must be divisible by num_experts={num_experts}")
+
+        expert_emb = emb_dim // num_experts
+        expert_d_model = d_model // num_experts
+
+        self.experts = nn.ModuleList([
+            RankMixerNSTokenizer(
+                feature_specs=feature_specs,
+                groups=groups,
+                emb_dim=expert_emb,
+                d_model=expert_d_model,
+                num_ns_tokens=num_ns_tokens,
+                emb_skip_threshold=emb_skip_threshold,
+                norm_type=norm_type,
+                hash_config=hash_config,
+                shuffle=shuffle,
+            )
+            for _ in range(num_experts)
+        ])
+
+    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+        outputs = [expert(int_feats) for expert in self.experts]
+        return torch.cat(outputs, dim=-1)  # (B, num_ns_tokens, d_model)
+
+
 class SENetProjection(nn.Module):
     """SENet-style per-position feature gating for per-step embeddings.
 
@@ -2402,6 +2453,8 @@ class PCVRHyFormer(nn.Module):
         item_ns_tokens: int = 0,
         # Shuffle fid order before concat during training
         shuffle_ns: bool = True,
+        # MoE embedding — K independent tokenizer experts (rankmixer only)
+        num_moe_experts: int = 1,
         # Dtype control
         dense_dtype: torch.dtype = torch.float32,
         sparse_dtype: torch.dtype = torch.float32,
@@ -2492,7 +2545,10 @@ class PCVRHyFormer(nn.Module):
                 user_ns_tokens = len(user_ns_groups)
             if item_ns_tokens <= 0:
                 item_ns_tokens = len(item_ns_groups)
-            self.user_ns_tokenizer = RankMixerNSTokenizer(
+            ns_cls = MoERankMixerNSTokenizer if num_moe_experts > 1 else RankMixerNSTokenizer
+            moe_kw = {} if num_moe_experts <= 1 else {'num_experts': num_moe_experts}
+            self.user_ns_tokenizer = ns_cls(
+                **moe_kw,
                 feature_specs=user_int_feature_specs,
                 groups=user_ns_groups,
                 emb_dim=emb_dim,
@@ -2505,7 +2561,8 @@ class PCVRHyFormer(nn.Module):
             )
             num_user_ns = user_ns_tokens
 
-            self.item_ns_tokenizer = RankMixerNSTokenizer(
+            self.item_ns_tokenizer = ns_cls(
+                **moe_kw,
                 feature_specs=item_int_feature_specs,
                 groups=item_ns_groups,
                 emb_dim=emb_dim,

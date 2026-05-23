@@ -83,6 +83,7 @@ _FALLBACK_MODEL_CFG = {
     'mixer_type': 'rank',
     'use_domain_emb': False,
     'shuffle_ns': True,
+    'num_moe_experts': 1,
     'hash_embedding': {},
     'seq_hash_embedding': {},
 }

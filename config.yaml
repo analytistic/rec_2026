@@ -58,6 +58,7 @@ ns_tokenizer_type: rankmixer
 user_ns_tokens: 8
 item_ns_tokens: 3
 shuffle_ns: true
+num_moe_experts: 1
 ns_groups_json: ""
 rank_mixer_mode: full
 
