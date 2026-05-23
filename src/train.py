@@ -74,6 +74,8 @@ def parse_args_and_config() -> Dict[str, Any]:
                         help='Training device, e.g. cuda or cpu')
     parser.add_argument('--num_workers', type=int, default=None,
                         help='Number of DataLoader workers')
+    parser.add_argument('--centroids_dir', type=str, default=None,
+                        help='K-means centroids for f61/f87 cluster features')
 
     cli_args = parser.parse_args()
 

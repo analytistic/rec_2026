@@ -14,13 +14,26 @@ python3 -m zipfile -e "${SCRIPT_DIR}/src.zip" "${SCRIPT_DIR}"
 # Uncomment to run preprocessing. Comment out after first run to skip.
 # python3 -u -m src.preprocess_split_by_timestamp --valid_ratio 0.1
 
-# ---- Step 2: Train ----
-# Valid reads from pre-split cache (strict time separation).
+# ---- Step 2 (optional): Pre-compute K-means centroids for f61/f87 ----
+# Uncomment on first run, then comment out to skip.
+# python3 -u -m src.kmeans_precompute \
+#     --data_dir "${TRAIN_DATA_PATH}" \
+#     --K 128 \
+#     --output_dir "${USER_CACHE_PATH}/centroids" \
+
+# ---- Step 3: Train ----
+CENTROIDS_DIR="${USER_CACHE_PATH}/centroids"
+if [ -d "$CENTROIDS_DIR" ]; then
+    CENTROIDS_ARG="--centroids_dir ${CENTROIDS_DIR}"
+else
+    CENTROIDS_ARG=""
+fi
 python3 -u -m src.train \
     --config "${SCRIPT_DIR}/config.yaml" \
     --data_dir "${TRAIN_DATA_PATH}" \
     --ckpt_dir "${TRAIN_CKPT_PATH}" \
     --log_dir "${TRAIN_LOG_PATH}" \
     --ns_groups_json "${SCRIPT_DIR}/v1.json" \
+    ${CENTROIDS_ARG} \
     #--valid_data_dir "${USER_CACHE_PATH}/valid" \
     "$@"
