@@ -152,8 +152,6 @@ def main() -> None:
         seq_max_lens=seq_max_lens,
         valid_data_dir=cfg.get('valid_data_dir'),
         add_seq_time_attrs=cfg.get('add_seq_time_attrs', True),
-        session_thresholds=cfg.get('session_thresholds'),
-        max_sessions=cfg.get('max_sessions', 20),
     )
 
     # ---- NS groups ----
@@ -273,7 +271,6 @@ def main() -> None:
         "seq_proj_type": cfg['seq_proj_type'],
         "seq_ffn_name": cfg['seq_ffn_name'],
         "seq_ffn_config": cfg['seq_ffn_config'],
-        "max_sessions": cfg.get('max_sessions', 20),
     }
 
     logging.info(f"Dtype config: dense={cfg['dense_dtype']}, sparse={cfg['sparse_dtype']}")

@@ -165,8 +165,6 @@ class PCVRParquetDataset(IterableDataset):
         is_training: bool = True,
         ts_max: Optional[int] = None,
         add_seq_time_attrs: bool = True,
-        session_thresholds: Optional[Dict[str, int]] = None,
-        max_sessions: int = 20,
     ) -> None:
         """
         Args:
@@ -191,16 +189,9 @@ class PCVRParquetDataset(IterableDataset):
             add_seq_time_attrs: if True, derive hour/dow/weekend from per-event
                 timestamps and include them as 3 additional seq features.
                 Set False via --no_seq_time_attrs.
-            session_thresholds: per-domain gap in seconds for session boundary
-                detection, e.g. ``{'seq_a': 3600, 'seq_b': 3600}``. Domains
-                not listed default to 0 (no session splitting).
-            max_sessions: maximum number of SESS tokens per sequence. Only the
-                last ``max_sessions`` sessions are kept.  Default 20.
         """
         super().__init__()
         self.add_seq_time_attrs = add_seq_time_attrs
-        self.session_thresholds = session_thresholds or {}
-        self.max_sessions = max_sessions
 
         # Accept either a directory or a single file path.
         if os.path.isdir(parquet_path):
@@ -770,33 +761,6 @@ class PCVRParquetDataset(IterableDataset):
                         # weekend: workday=1, weekend=2
                         out[:, n_real + 2, :][valid_events] = (dow_raw >= 5).astype(np.int64) + 1
 
-            # ---- Session IDs (gaps > threshold → new session) ----
-            session_ids = np.zeros((B, max_len), dtype=np.int64)
-            threshold = self.session_thresholds.get(domain, 0)
-            if threshold > 0 and ts_ci is not None:
-                for i in range(B):
-                    length = lengths[i]
-                    if length == 0:
-                        continue
-                    sess_id = 1
-                    session_ids[i, 0] = sess_id
-                    for j in range(1, length):
-                        if abs(ts_padded[i, j] - ts_padded[i, j - 1]) > threshold:
-                            sess_id += 1
-                        session_ids[i, j] = sess_id
-
-            # ---- sess_event_mask: (B, K, L) where K = max_sessions ----
-            sess_event_mask = np.zeros((B, self.max_sessions, max_len), dtype=np.int64)
-            if threshold > 0 and ts_ci is not None:
-                shifted = np.zeros_like(session_ids)
-                shifted[:, 1:] = session_ids[:, :-1]
-                new_sess = (session_ids != shifted) & (session_ids > 0)
-                sess_idx = np.zeros_like(session_ids)
-                sess_idx[:, 1:] = np.cumsum(new_sess[:, 1:], axis=1)
-                K = self.max_sessions
-                target = np.arange(K, dtype=np.int64)[np.newaxis, :, np.newaxis]
-                sess_event_mask = (sess_idx[:, np.newaxis, :] == target).astype(np.int64)
-
             result[domain] = torch.from_numpy(out.copy())
             result[f'{domain}_len'] = torch.from_numpy(lengths.copy())
 
@@ -825,8 +789,6 @@ class PCVRParquetDataset(IterableDataset):
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
             result[f'{domain}_timestamp'] = torch.from_numpy(ts_padded.copy())
-            result[f'{domain}_session_ids'] = torch.from_numpy(session_ids)
-            result[f'{domain}_sess_event_mask'] = torch.from_numpy(sess_event_mask)
 
         return result
 
@@ -845,8 +807,6 @@ def get_pcvr_data(
     seq_max_lens: Optional[Dict[str, int]] = None,
     valid_data_dir: Optional[str] = None,
     add_seq_time_attrs: bool = True,
-    session_thresholds: Optional[Dict[str, int]] = None,
-    max_sessions: int = 20,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -901,8 +861,6 @@ def get_pcvr_data(
             clip_vocab=clip_vocab,
             ts_max=ts_max,
             add_seq_time_attrs=add_seq_time_attrs,
-            session_thresholds=session_thresholds,
-            max_sessions=max_sessions,
         )
         train_loader = DataLoader(
             train_dataset, batch_size=None,
@@ -919,8 +877,6 @@ def get_pcvr_data(
             row_group_range=None,
             clip_vocab=clip_vocab,
             add_seq_time_attrs=add_seq_time_attrs,
-            session_thresholds=session_thresholds,
-            max_sessions=max_sessions,
         )
         valid_loader = DataLoader(
             valid_dataset, batch_size=None,
@@ -972,8 +928,6 @@ def get_pcvr_data(
             row_group_range=(0, n_train_rgs),
             clip_vocab=clip_vocab,
             add_seq_time_attrs=add_seq_time_attrs,
-            session_thresholds=session_thresholds,
-            max_sessions=max_sessions,
         )
         train_loader = DataLoader(
             train_dataset, batch_size=None,
@@ -990,8 +944,6 @@ def get_pcvr_data(
             row_group_range=(total_rgs - n_valid_rgs, total_rgs),
             clip_vocab=clip_vocab,
             add_seq_time_attrs=add_seq_time_attrs,
-            session_thresholds=session_thresholds,
-            max_sessions=max_sessions,
         )
         valid_loader = DataLoader(
             valid_dataset, batch_size=None,

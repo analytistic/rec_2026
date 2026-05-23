@@ -84,7 +84,6 @@ _FALLBACK_MODEL_CFG = {
     'use_domain_emb': False,
     'hash_embedding': {},
     'seq_hash_embedding': {},
-    'max_sessions': 20,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -367,8 +366,6 @@ def _batch_to_model_input(
     seq_lens: Dict[str, torch.Tensor] = {}
     seq_time_buckets: Dict[str, torch.Tensor] = {}
     seq_timestamps: Dict[str, torch.Tensor] = {}
-    seq_session_ids: Dict[str, torch.Tensor] = {}
-    seq_sess_event_masks: Dict[str, torch.Tensor] = {}
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
@@ -379,12 +376,6 @@ def _batch_to_model_input(
         seq_timestamps[domain] = device_batch.get(
             f'{domain}_timestamp',
             torch.zeros(B, L, dtype=torch.long, device=device))
-        seq_session_ids[domain] = device_batch.get(
-            f'{domain}_session_ids',
-            torch.zeros(B, L, dtype=torch.long, device=device))
-        sess_mask = device_batch.get(f'{domain}_sess_event_mask')
-        if sess_mask is not None:
-            seq_sess_event_masks[domain] = sess_mask
 
     timestamp = device_batch.get('timestamp', torch.zeros(B, dtype=torch.long, device=device))
     hour = device_batch.get('hour', torch.zeros(B, dtype=torch.long, device=device))
@@ -406,8 +397,6 @@ def _batch_to_model_input(
         hour=hour,
         dow=dow,
         weekend=weekend,
-        seq_session_ids=seq_session_ids,
-        seq_sess_event_masks=seq_sess_event_masks,
     )
 
 
@@ -441,7 +430,6 @@ def main() -> None:
     num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
 
     add_seq_time_attrs = train_config.get('add_seq_time_attrs', True)
-    session_thresholds = train_config.get('session_thresholds', None)
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
         schema_path=schema_path,
@@ -451,8 +439,6 @@ def main() -> None:
         buffer_batches=0,
         is_training=False,
         add_seq_time_attrs=add_seq_time_attrs,
-        session_thresholds=session_thresholds,
-        max_sessions=int(train_config.get('max_sessions', 20)),
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")

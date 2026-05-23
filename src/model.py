@@ -48,8 +48,6 @@ class ModelInput(NamedTuple):
     weekend: torch.Tensor  # [B], row-level weekend flag (1=workday, 2=weekend)
     paired_int_feats: torch.Tensor = None   # (B, total_paired_int_dim), optional
     paired_float_feats: torch.Tensor = None  # (B, total_paired_float_dim), optional
-    seq_session_ids: dict = {}  # {domain: tensor [B, L]}, session membership per event
-    seq_sess_event_masks: dict = {}  # {domain: tensor [B, K, L]}, SESS→event membership mask
 
 
 class ModelOutput(NamedTuple):
@@ -68,7 +66,6 @@ class MixerFFNInput(NamedTuple):
     user_token: torch.Tensor
     item_token: torch.Tensor
     query_token: Dict[str, torch.Tensor]
-    interest_token: Dict[str, torch.Tensor]
 
 
 class MixerFFNOutput(NamedTuple):
@@ -76,26 +73,6 @@ class MixerFFNOutput(NamedTuple):
     user_token: torch.Tensor
     item_token: torch.Tensor
     query_token: Dict[str, torch.Tensor]
-    interest_token: Dict[str, torch.Tensor]
-
-class MultiSeqHyFormerBlockInput(NamedTuple):
-    q_tokens_list: list
-    interest_tokens_list: list
-    ns_tokens: torch.Tensor
-    seq_tokens_list: list
-    seq_padding_masks: list
-    rope_cos_list: Optional[List[Optional[torch.Tensor]]] = None
-    rope_sin_list: Optional[List[Optional[torch.Tensor]]] = None
-    sess_attn_masks_list: Optional[List[Optional[torch.Tensor]]] = None
-    sess_Ks_list: Optional[List[Optional[int]]] = None
-
-
-class MultiSeqHyFormerBlockOutput(NamedTuple):
-    q_tokens_list: list
-    interest_tokens_list: list
-    ns_tokens: torch.Tensor
-    seq_tokens_list: list
-    seq_padding_masks: list
 
 
 class UIQFFN(nn.Module):
@@ -143,13 +120,10 @@ class UIQFFN(nn.Module):
         user_out = self.user_ffn(x.user_token)
         item_out = self.item_ffn(x.item_token)
         query_out = {d: self.query_ffn(x.query_token[d]) for d in x.query_token}
-        interest_out = {d: self.query_ffn(x.interest_token[d]) for d in x.interest_token}
         # Concat outputs + residual from inputs → norm → split back
         out_parts = ([query_out[d] for d in self.query_domains]
-                     + [interest_out[d] for d in self.query_domains]
                      + [user_out, item_out])
         in_parts = ([x.query_token[d] for d in self.query_domains]
-                    + [x.interest_token[d] for d in self.query_domains]
                     + [x.user_token, x.item_token])
         flat = self.ffn_norm(torch.cat(out_parts, dim=1) + torch.cat(in_parts, dim=1))
         offset = 0
@@ -158,17 +132,11 @@ class UIQFFN(nn.Module):
             nq = x.query_token[d].shape[1]
             qo[d] = flat[:, offset:offset + nq, :]
             offset += nq
-        io_dict = {}
-        for d in self.query_domains:
-            ni = x.interest_token[d].shape[1]
-            io_dict[d] = flat[:, offset:offset + ni, :]
-            offset += ni
         un = x.user_token.shape[1]
         uo = flat[:, offset:offset + un, :]
         offset += un
         io = flat[:, offset:, :]
-        return MixerFFNOutput(user_token=uo, item_token=io,
-                              query_token=qo, interest_token=io_dict)
+        return MixerFFNOutput(user_token=uo, item_token=io, query_token=qo)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -409,17 +377,10 @@ class RoPEMultiheadAttention(nn.Module):
             sdpa_attn_mask = sdpa_attn_mask.expand(B, self.num_heads, Lq, Lk)
 
         if attn_mask is not None:
-            if attn_mask.dim() == 2:
-                # 2D non-batched additive float mask (Lq, Lk): 0=attend, -inf=block
-                bool_attn = (attn_mask == 0)  # (Lq, Lk)
-                bool_attn = bool_attn.unsqueeze(0).unsqueeze(0).expand(B, self.num_heads, Lq, Lk)
-            elif attn_mask.dim() == 4:
-                # Pre-batched boolean mask (B, 1, Lq, Lk) or (B, num_heads, Lq, Lk)
-                bool_attn = attn_mask.bool()
-                if bool_attn.shape[1] == 1:
-                    bool_attn = bool_attn.expand(-1, self.num_heads, -1, -1)
-            else:
-                raise ValueError(f"Unsupported attn_mask dims: {attn_mask.dim()}")
+            # attn_mask: additive float mask (Lq, Lk), -inf means do not attend
+            # Convert to bool: positions that are not -inf are True
+            bool_attn = (attn_mask == 0)  # (Lq, Lk)
+            bool_attn = bool_attn.unsqueeze(0).unsqueeze(0).expand(B, self.num_heads, Lq, Lk)
             if sdpa_attn_mask is not None:
                 sdpa_attn_mask = sdpa_attn_mask & bool_attn
             else:
@@ -651,31 +612,23 @@ class SharedFFN(nn.Module):
 
     def forward(self, x: MixerFFNInput) -> MixerFFNOutput:
         # Concat groups → flat → process → residual+norm
-        parts = ([x.interest_token[d] for d in self.query_domains]
-                 + [x.query_token[d] for d in self.query_domains]
+        parts = ([x.query_token[d] for d in self.query_domains]
                  + [x.user_token, x.item_token])
         flat = torch.cat(parts, dim=1)
         out = self.net(flat)
         out = self.ffn_norm(out + flat)
-        # Split back by input shapes (matches parts order: i, q, user, item)
-        offset_i = 0
-        offset_q = 0 + sum(x.interest_token[d].shape[1] for d in self.query_domains)
-        io_dict = {}
-        qo_dict = {}
+        # Split back by input shapes
+        offset = 0
+        qo = {}
         for d in self.query_domains:
-            ni = x.interest_token[d].shape[1]
-            io_dict[d] = out[:, offset_i:offset_i + ni, :]
-            offset_i += ni
             nq = x.query_token[d].shape[1]
-            qo_dict[d] = out[:, offset_q:offset_q + nq, :]
-            offset_q += nq
-        offset_u = offset_q
+            qo[d] = out[:, offset:offset + nq, :]
+            offset += nq
         un = x.user_token.shape[1]
-        uo = out[:, offset_u:offset_u + un, :]
-        offset_it = offset_u + un
-        io = out[:, offset_it: , :]
-        return MixerFFNOutput(user_token=uo, item_token=io,
-                              query_token=qo_dict, interest_token=io_dict)
+        uo = out[:, offset:offset + un, :]
+        offset += un
+        io = out[:, offset:, :]
+        return MixerFFNOutput(user_token=uo, item_token=io, query_token=qo)
 
 
 class DenseMoE(nn.Module):
@@ -1090,7 +1043,6 @@ class RankMixerBlockV2(nn.Module):
         self.item_token_num = item_token_num
         self.query_domains = query_domains or []
         self.num_queries = num_queries
-        self.num_interest = 1
 
         if mode == 'none':
             return
@@ -1111,7 +1063,7 @@ class RankMixerBlockV2(nn.Module):
             raise ValueError(f"Unknown ffn_name: {ffn_name!r}, "
                              f"available: {list(self.FFN_REGISTRY.keys())}")
         ffn_cls = self.FFN_REGISTRY[ffn_name]
-        total_ns_tokens = self.num_interest * len(self.query_domains) + num_queries * len(self.query_domains) + user_token_num + item_token_num
+        total_ns_tokens = num_queries * len(self.query_domains) + user_token_num + item_token_num
         ffn_kwargs = {**ffn_config, 'query_domains': self.query_domains,
                       'norm_type': norm_type}
         if ffn_name == 'per_token':
@@ -1126,23 +1078,16 @@ class RankMixerBlockV2(nn.Module):
 
         Flat order: [queries (per-domain), user_tokens, item_tokens].
         """
-        offset_q = 0 + self.num_interest * len(self.query_domains)
-        offset_i = 0
+        offset = 0
         query_token = {}
-        interest_token = {}
         for domain in self.query_domains:
-            query_token[domain] = x[:, offset_q:offset_q + self.num_queries, :]
-            interest_token[domain] = x[:, offset_i:offset_i + self.num_interest, :]
-            offset_q += self.num_queries
-            offset_i += self.num_interest
-        user_token = x[:, offset_q:offset_q + self.user_token_num, :]
-        offset_q += self.user_token_num
-        item_token = x[:, offset_q:, :]
-        return MixerFFNInput(user_token=user_token, 
-                             item_token=item_token,
-                             query_token=query_token, 
-                             interest_token=interest_token
-                            )
+            query_token[domain] = x[:, offset:offset + self.num_queries, :]
+            offset += self.num_queries
+        user_token = x[:, offset:offset + self.user_token_num, :]
+        offset += self.user_token_num
+        item_token = x[:, offset:, :]
+        return MixerFFNInput(user_token=user_token, item_token=item_token,
+                             query_token=query_token)
 
     def forward(self, Q: torch.Tensor) -> MixerFFNOutput:
         """Token mixing → split → FFN (residual+norm inside) → MixerFFNOutput."""
@@ -1400,7 +1345,6 @@ class TransformerEncoder(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         rope_cos: Optional[torch.Tensor] = None,
         rope_sin: Optional[torch.Tensor] = None,
-        attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Applies one Transformer encoder layer.
 
@@ -1409,8 +1353,6 @@ class TransformerEncoder(nn.Module):
             key_padding_mask: (B, L), True indicates padding positions.
             rope_cos: (1, L, head_dim), RoPE cosine values.
             rope_sin: (1, L, head_dim), RoPE sine values.
-            attn_mask: Optional (B, 1, L, L) or (B, num_heads, L, L) boolean mask
-                for fine-grained attention control. True = attend.
 
         Returns:
             Tuple of (output tensor of shape (B, L, D), key_padding_mask).
@@ -1425,7 +1367,6 @@ class TransformerEncoder(nn.Module):
             key_padding_mask=key_padding_mask,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
-            attn_mask=attn_mask,
         )
         x = residual + x
 
@@ -1715,19 +1656,6 @@ class MultiSeqHyFormerBlock(nn.Module):
         self.num_queries = num_queries
         self.num_ns = num_ns
         self.seq_domains = seq_domains or []
-        self.user_token_num = user_token_num
-        self.item_token_num = item_token_num
-        assert self.user_token_num + self.item_token_num == self.num_ns, "user_token_num + item_token_num must equal num_ns"
-
-        self.din_cross_attn = nn.ModuleList([
-            DINModule(
-                d_model=d_model,
-                item_ns_dim=self.item_token_num,
-                hidden_mult=hidden_mult,
-                dropout=dropout,
-            )
-            for _ in range(num_sequences)       
-        ])
 
         # Independent sequence encoder per sequence
         self.seq_encoders = nn.ModuleList([
@@ -1758,8 +1686,8 @@ class MultiSeqHyFormerBlock(nn.Module):
             for _ in range(num_sequences)
         ])
 
-        # RankMixer: input token count = (Nq + 1) * S + Nns (1 extra interest per domain)
-        n_total = (num_queries + 1) * num_sequences + num_ns
+        # RankMixer: input token count = Nq * S + Nns
+        n_total = num_queries * num_sequences + num_ns
         self.mixer = RankMixerBlockV2(
             d_model=d_model,
             n_total=n_total,
@@ -1778,19 +1706,30 @@ class MultiSeqHyFormerBlock(nn.Module):
 
     def forward(
         self,
-        inp: MultiSeqHyFormerBlockInput,
-    ) -> MultiSeqHyFormerBlockOutput:
-        """Processes one multi-sequence HyFormer block step."""
-        q_tokens_list = inp.q_tokens_list
-        interest_tokens_list = inp.interest_tokens_list
-        ns_tokens = inp.ns_tokens
-        seq_tokens_list = inp.seq_tokens_list
-        seq_padding_masks = inp.seq_padding_masks
-        rope_cos_list = inp.rope_cos_list
-        rope_sin_list = inp.rope_sin_list
-        sess_attn_masks_list = inp.sess_attn_masks_list
-        sess_Ks_list = inp.sess_Ks_list
+        q_tokens_list: list,
+        ns_tokens: torch.Tensor,
+        seq_tokens_list: list,
+        seq_padding_masks: list,
+        rope_cos_list: Optional[List[torch.Tensor]] = None,
+        rope_sin_list: Optional[List[torch.Tensor]] = None,
+    ) -> Tuple[list, torch.Tensor, list, list]:
+        """Processes one multi-sequence HyFormer block step.
 
+        Args:
+            q_tokens_list: List of (B, Nq, D) tensors, length S.
+            ns_tokens: (B, Nns, D)
+            seq_tokens_list: List of (B, L_i, D) tensors, length S.
+            seq_padding_masks: List of (B, L_i) masks, length S.
+            rope_cos_list: List of (1, L_i, head_dim) tensors, length S.
+            rope_sin_list: List of (1, L_i, head_dim) tensors, length S.
+
+        Returns:
+            A tuple (next_q_list, next_ns, next_seq_list, next_masks), where
+            next_q_list is a list of (B, Nq, D) updated query tensors,
+            next_ns is (B, Nns, D) updated non-sequence tokens,
+            next_seq_list is a list of (B, L_i', D) encoded sequence tensors,
+            and next_masks is a list of (B, L_i') updated padding masks.
+        """
         S = self.num_sequences
         Nq = self.num_queries
 
@@ -1800,69 +1739,36 @@ class MultiSeqHyFormerBlock(nn.Module):
         for i in range(S):
             rc = rope_cos_list[i] if rope_cos_list is not None else None
             rs = rope_sin_list[i] if rope_sin_list is not None else None
-            attn_mask_i = sess_attn_masks_list[i] if sess_attn_masks_list is not None else None
             result = self.seq_encoders[i](
                 seq_tokens_list[i], seq_padding_masks[i],
                 rope_cos=rc, rope_sin=rs,
-                attn_mask=attn_mask_i,
             )
             next_seq_i, mask_i = result
             next_seqs.append(next_seq_i)
             next_masks.append(mask_i)
 
         # 2. Independent Query Decoding per sequence
-        # Only event tokens (not SESS) are used as K/V.
         decoded_qs = []
         for i in range(S):
             rc = rope_cos_list[i] if rope_cos_list is not None else None
             rs = rope_sin_list[i] if rope_sin_list is not None else None
-            if sess_Ks_list is not None and sess_Ks_list[i] is not None and sess_Ks_list[i] > 0:
-                K = sess_Ks_list[i]
-                event_out = next_seqs[i][:, K:, :]
-                event_mask = next_masks[i][:, K:]
-            else:
-                event_out = next_seqs[i]
-                event_mask = next_masks[i]
             decoded_q_i = self.cross_attns[i](
-                q_tokens_list[i], event_out, event_mask,
+                q_tokens_list[i], next_seqs[i], next_masks[i],
                 rope_cos=rc, rope_sin=rs,
             )
             decoded_qs.append(decoded_q_i)
 
-        # Intrest tokens passthrough (not updated in this block)
-        decoded_is = []
-        for i in range(S):
-            if sess_Ks_list is not None and sess_Ks_list[i] is not None and sess_Ks_list[i] > 0:
-                sess_out = next_seqs[i][:, :sess_Ks_list[i], :]
-                sess_mask = next_masks[i][:, :sess_Ks_list[i]]
-            else:
-                sess_out = next_seqs[i]
-                sess_mask = next_masks[i]
-            
-            decoded_i_i = self.din_cross_attn[i](ns_tokens[:, -self.item_token_num:], sess_out, sess_mask)
-            decoded_is.append(decoded_i_i.unsqueeze(1))  # (B, 1, D)
-
-
-            
-        # 3. Token Fusion: [i0..iS-1, q0..qS-1, user, item]
-        interleaved = decoded_is + decoded_qs + [ns_tokens]
-        combined = torch.cat(interleaved, dim=1)
+        # 3. Token Fusion: concatenate all decoded_q + ns_tokens
+        combined = torch.cat(decoded_qs + [ns_tokens], dim=1)  # (B, Nq*S + Nns, D)
 
         # 4. Query Boosting (returns MixerFFNOutput with residual+norm applied)
         mixer_out = self.mixer(combined)
 
-        # 5. Extract per-domain Q, interest, and NS from MixerFFNOutput
+        # 5. Extract per-domain Q and NS from MixerFFNOutput
         next_q_list = [mixer_out.query_token[d] for d in self.seq_domains]
-        next_interest_list = [mixer_out.interest_token[d] for d in self.seq_domains]
         next_ns = torch.cat([mixer_out.user_token, mixer_out.item_token], dim=1)
 
-        return MultiSeqHyFormerBlockOutput(
-            q_tokens_list=next_q_list,
-            interest_tokens_list=next_interest_list,
-            ns_tokens=next_ns,
-            seq_tokens_list=next_seqs,
-            seq_padding_masks=next_masks,
-        )
+        return next_q_list, next_ns, next_seqs, next_masks
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2401,60 +2307,6 @@ class PairedProcessor(nn.Module):
         return out.unsqueeze(1)            # (B, 1, d_model)
 
 
-class DINModule(nn.Module):
-    """Deep Interest Network: attention-pool a sequence by query similarity.
-
-    For each element seq_k, computes an attention weight:
-        score_k = sigmoid(MLP(concat(q_flat, seq_k, q_proj-seq_k, q_proj*seq_k)))
-    Then returns weighted sum: sum(score_k * seq_k) as the interest vector.
-
-    Args:
-        d_model: model dimension.
-        item_ns_dim: number of item NS tokens (N). MLP input dim = (N+3)*D.
-        hidden_mult: MLP hidden = d_model * hidden_mult.
-        dropout: dropout rate on MLP hidden.
-    """
-    def __init__(self, d_model: int, item_ns_dim: int = 1,
-                 hidden_mult: int = 4, dropout: float = 0.0):
-        super().__init__()
-        if item_ns_dim > 1:
-            self.query_proj = nn.Linear(item_ns_dim * d_model, d_model)
-        else:
-            self.query_proj = nn.Identity()
-        mlp_in_dim = (item_ns_dim + 3) * d_model
-        hidden_dim = d_model * hidden_mult
-        self.mlp = nn.Sequential(
-            nn.Linear(mlp_in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, query: torch.Tensor, seq: torch.Tensor,
-                key_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Weighted-sum-pool the sequence by query relevance.
-
-        Args:
-            query: (B, N, D) — item NS tokens (target representation).
-            seq: (B, K, D) — K session representations to pool over.
-            key_mask: optional (B, K) bool, True = masked/padded session.
-
-        Returns:
-            interest: (B, D)
-        """
-        B, K, D = seq.shape
-        q_flat = query.reshape(B, -1)  # (B, N*D)
-        q_proj = self.query_proj(q_flat)  # (B, D)
-        q_flat_k = q_flat.unsqueeze(1).expand(B, K, -1)  # (B, K, N*D)
-        q_proj_k = q_proj.unsqueeze(1).expand(B, K, -1)  # (B, K, D)
-        cat = torch.cat([q_flat_k, seq, q_proj_k - seq, q_proj_k * seq], dim=-1)
-        scores = self.mlp(cat).sigmoid()  # (B, K, 1)
-        if key_mask is not None:
-            scores = scores.masked_fill(key_mask.unsqueeze(-1), 0.0)
-        interest = (scores * seq).sum(dim=1)  # (B, D)
-        return interest
-
-
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -2512,8 +2364,6 @@ class PCVRHyFormer(nn.Module):
         fourier_seq: bool = True,
         fourier_ns: bool = True,
         use_row_time_ns: bool = True,
-        # Session-aware DIN
-        max_sessions: int = 20,
         # FFN variant for RankMixer
         ffn_name: str = 'shared',
         ffn_config: dict = {},
@@ -2535,7 +2385,6 @@ class PCVRHyFormer(nn.Module):
         self.emb_dim = emb_dim
         self.action_num = action_num
         self.num_queries = num_queries
-        self.num_interest_tokens = 1
         self.seq_domains = sorted(seq_vocab_sizes.keys())  # deterministic order
         self.num_sequences = len(self.seq_domains)
         self.num_time_buckets = num_time_buckets
@@ -2549,7 +2398,6 @@ class PCVRHyFormer(nn.Module):
         self.norm_type = norm_type
         self.fourier_seq = fourier_seq
         self.fourier_ns = fourier_ns
-        self.max_sessions = max_sessions
         self.ffn_name = ffn_name
         self.ffn_config = ffn_config
         self.mixer_type = mixer_type
@@ -2698,7 +2546,7 @@ class PCVRHyFormer(nn.Module):
                            + (1 if self.has_time_ns else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
-        T = (num_queries + self.num_interest_tokens) * self.num_sequences + self.num_ns
+        T = num_queries * self.num_sequences + self.num_ns
         if rank_mixer_mode == 'full' and d_model % T != 0:
             valid_T_values = [t for t in range(1, d_model + 1) if d_model % t == 0]
             raise ValueError(
@@ -2812,12 +2660,6 @@ class PCVRHyFormer(nn.Module):
         if fourier_seq:
             self.seq_time_fourier = FourierTimeEncoding(d_model=emb_dim)
 
-        # ================== Session-aware SESS Embeddings ==================
-        # Per-domain learnable SESS base embeddings + shared position encoding.
-        self.sess_base_emb = nn.ModuleDict({
-            domain: nn.Embedding(1, d_model) for domain in self.seq_domains
-        })
-        self.sess_pos_emb = nn.Embedding(max_sessions, d_model)
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
@@ -2867,7 +2709,7 @@ class PCVRHyFormer(nn.Module):
 
         # Output projection
         self.output_proj = nn.Sequential(
-            nn.Linear((num_queries) * self.num_sequences * d_model, d_model),
+            nn.Linear(num_queries * self.num_sequences * d_model, d_model),
             MixedNorm(d_model, norm_type),
         )
 
@@ -3135,62 +2977,14 @@ class PCVRHyFormer(nn.Module):
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
 
-    def _make_session_attn_mask(
-        self,
-        sess_event_mask: torch.Tensor,
-        K: int,
-        L: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Build (B, 1, K+L, K+L) boolean attention mask for SESS + events.
-
-        The mask enforces:
-        - SESS→SESS: only self (diagonal)
-        - SESS→event: only events in the same session
-        - event→SESS: no attend (False)
-        - event→event: full attend (True)
-
-        Args:
-            sess_event_mask: (B, K, L), 1=event l belongs to session k.
-            K: number of SESS tokens.
-            L: sequence length.
-            device: target device.
-
-        Returns:
-            attn_mask: (B, 1, K+L, K+L) boolean, True=attend.
-        """
-        B = sess_event_mask.shape[0]
-
-        # SESS→SESS: diagonal only (each SESS attends to itself)
-        sess_sess = torch.eye(K, dtype=torch.bool, device=device)  # (K, K)
-        sess_sess = sess_sess.unsqueeze(0).expand(B, K, K)  # (B, K, K)
-
-        # SESS→event: from sess_event_mask
-        sess_event = sess_event_mask.bool()  # (B, K, L)
-
-        # event→SESS: all False (events don't attend to SESS)
-        event_sess = torch.zeros(B, L, K, dtype=torch.bool, device=device)
-
-        # event→event: all True
-        event_event = torch.ones(B, L, L, dtype=torch.bool, device=device)
-
-        # Combine
-        top = torch.cat([sess_sess, sess_event], dim=2)   # (B, K, K+L)
-        bottom = torch.cat([event_sess, event_event], dim=2)  # (B, L, K+L)
-        attn_mask = torch.cat([top, bottom], dim=1).unsqueeze(1)  # (B, 1, K+L, K+L)
-
-        return attn_mask
-
     def _run_multi_seq_blocks(
         self,
         q_tokens_list: list,
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
         seq_masks_list: list,
-        apply_dropout: bool = True,
-        sess_attn_masks_list: Optional[List[Optional[torch.Tensor]]] = None,
-        sess_Ks_list: Optional[List[Optional[int]]] = None,
-    ) -> Tuple[torch.Tensor, List[Optional[torch.Tensor]]]:
+        apply_dropout: bool = True
+    ) -> torch.Tensor:
         """Runs the multi-sequence block stack with dropout and output projection."""
         if apply_dropout:
             q_tokens_list = [self.emb_dropout(q) for q in q_tokens_list]
@@ -3198,7 +2992,6 @@ class PCVRHyFormer(nn.Module):
             seq_tokens_list = [self.emb_dropout(s) for s in seq_tokens_list]
 
         curr_qs = q_tokens_list
-        curr_interest_tokens_list: list = [None] * len(self.seq_domains)
         curr_ns = ns_tokens
         curr_seqs = seq_tokens_list
         curr_masks = seq_masks_list
@@ -3217,41 +3010,22 @@ class PCVRHyFormer(nn.Module):
                     rope_cos_list.append(cos)
                     rope_sin_list.append(sin)
 
-            block_inp = MultiSeqHyFormerBlockInput(
+            curr_qs, curr_ns, curr_seqs, curr_masks = block(
                 q_tokens_list=curr_qs,
-                interest_tokens_list=curr_interest_tokens_list,
                 ns_tokens=curr_ns,
                 seq_tokens_list=curr_seqs,
                 seq_padding_masks=curr_masks,
                 rope_cos_list=rope_cos_list,
                 rope_sin_list=rope_sin_list,
-                sess_attn_masks_list=sess_attn_masks_list,
-                sess_Ks_list=sess_Ks_list,
             )
-            block_out = block(block_inp)
-            curr_qs = block_out.q_tokens_list
-            curr_interest_tokens_list = block_out.interest_tokens_list
-            curr_ns = block_out.ns_tokens
-            curr_seqs = block_out.seq_tokens_list
-            curr_masks = block_out.seq_padding_masks
 
         # Output: concatenate all sequences' Q tokens then project via MLP
         B = curr_qs[0].shape[0]
-        all_q = torch.cat(curr_qs, dim=1) 
-        output = all_q.view(B, -1)  
-        output = self.output_proj(output)  
+        all_q = torch.cat(curr_qs, dim=1)  # (B, Nq*S, D)
+        output = all_q.view(B, -1)  # (B, Nq*S*D)
+        output = self.output_proj(output)  # (B, D)
 
-        # Extract SESS outputs from the last block for DIN.
-        sess_outputs_list = []
-        for i, domain in enumerate(self.seq_domains):
-            if sess_Ks_list is not None and sess_Ks_list[i] is not None and sess_Ks_list[i] > 0:
-                K = sess_Ks_list[i]
-                sess_out = curr_seqs[i][:, :K, :]  # (B, K, D)
-                sess_outputs_list.append(sess_out)
-            else:
-                sess_outputs_list.append(None)
-
-        return output, sess_outputs_list
+        return output
 
     def forward(self, inputs: ModelInput) -> ModelOutput:
         """Runs the forward pass of the PCVRHyFormer model."""
@@ -3325,48 +3099,10 @@ class PCVRHyFormer(nn.Module):
             ns_tokens = ns_tokens + self.time_fourier(inputs.timestamp.unsqueeze(-1))
             q_tokens_list = [q + self.time_fourier(inputs.timestamp.unsqueeze(-1)) for q in q_tokens_list]
 
-        # 4.5. SESS token concat: build session embeddings and concatenate to seq tokens
-        seq_sess_tokens_list = []
-        seq_sess_masks_list = []
-        sess_attn_masks_list: List[Optional[torch.Tensor]] = []
-        sess_Ks_list: List[Optional[int]] = []
-        for i, domain in enumerate(self.seq_domains):
-            sess_mask = inputs.seq_sess_event_masks.get(domain)
-            if sess_mask is not None and self.max_sessions > 0 and sess_mask.any():
-                B, K, L = sess_mask.shape
-                device = sess_mask.device
-                # SESS base embedding + position encoding + session mean pool
-                sess_base = self.sess_base_emb[domain].weight  # (1, D)
-                sess_pos = self.sess_pos_emb.weight[:K].unsqueeze(0)  # (1, K, D)
-                mask_sum = sess_mask.sum(dim=-1, keepdim=True).clamp(min=1)  # (B, K, 1)
-                sess_mean = (sess_mask.unsqueeze(-1).float()
-                             * seq_tokens_list[i].unsqueeze(1)).sum(dim=2) / mask_sum  # (B, K, D)
-                sess_emb = (sess_base + sess_pos).expand(B, -1, -1) + sess_mean  # (B, K, D)
-                sess_emb = sess_emb.to(self.dense_dtype)
-                # Concat to seq tokens: (B, L, D) → (B, K+L, D)
-                combined_tokens = torch.cat([sess_emb, seq_tokens_list[i]], dim=1)
-                seq_sess_tokens_list.append(combined_tokens)
-                # Update padding mask: SESS positions are never padding
-                not_pad = torch.zeros(B, K, dtype=torch.bool, device=device)
-                combined_mask = torch.cat([not_pad, seq_masks_list[i]], dim=1)
-                seq_sess_masks_list.append(combined_mask)
-                # Build session attention mask
-                attn_mask = self._make_session_attn_mask(
-                    sess_mask.bool(), K, L, device)
-                sess_attn_masks_list.append(attn_mask)
-                sess_Ks_list.append(K)
-            else:
-                seq_sess_tokens_list.append(seq_tokens_list[i])
-                seq_sess_masks_list.append(seq_masks_list[i])
-                sess_attn_masks_list.append(None)
-                sess_Ks_list.append(None)
-
         # 5. Dropout + MultiSeqHyFormerBlock stack + output projection
-        output, sess_outputs_list = self._run_multi_seq_blocks(
-            q_tokens_list, ns_tokens, seq_sess_tokens_list, seq_sess_masks_list,
-            apply_dropout=self.training,
-            sess_attn_masks_list=sess_attn_masks_list,
-            sess_Ks_list=sess_Ks_list,
+        output = self._run_multi_seq_blocks(
+            q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+            apply_dropout=self.training
         )
 
         # 5. Classifier
@@ -3441,42 +3177,9 @@ class PCVRHyFormer(nn.Module):
             ns_tokens = ns_tokens + self.time_fourier(inputs.timestamp.unsqueeze(-1))
             q_tokens_list = [q + self.time_fourier(inputs.timestamp.unsqueeze(-1)) for q in q_tokens_list]
 
-        # 4.5. SESS token concat (identical to forward)
-        seq_sess_tokens_list = []
-        seq_sess_masks_list = []
-        sess_attn_masks_list: List[Optional[torch.Tensor]] = []
-        sess_Ks_list: List[Optional[int]] = []
-        for i, domain in enumerate(self.seq_domains):
-            sess_mask = inputs.seq_sess_event_masks.get(domain)
-            if sess_mask is not None and self.max_sessions > 0 and sess_mask.any():
-                B, K, L = sess_mask.shape
-                device = sess_mask.device
-                sess_base = self.sess_base_emb[domain].weight
-                sess_pos = self.sess_pos_emb.weight[:K].unsqueeze(0)
-                mask_sum = sess_mask.sum(dim=-1, keepdim=True).clamp(min=1)
-                sess_mean = (sess_mask.unsqueeze(-1).float()
-                             * seq_tokens_list[i].unsqueeze(1)).sum(dim=2) / mask_sum
-                sess_emb = (sess_base + sess_pos).expand(B, -1, -1) + sess_mean
-                sess_emb = sess_emb.to(self.dense_dtype)
-                combined_tokens = torch.cat([sess_emb, seq_tokens_list[i]], dim=1)
-                seq_sess_tokens_list.append(combined_tokens)
-                not_pad = torch.zeros(B, K, dtype=torch.bool, device=device)
-                combined_mask = torch.cat([not_pad, seq_masks_list[i]], dim=1)
-                seq_sess_masks_list.append(combined_mask)
-                attn_mask = self._make_session_attn_mask(sess_mask.bool(), K, L, device)
-                sess_attn_masks_list.append(attn_mask)
-                sess_Ks_list.append(K)
-            else:
-                seq_sess_tokens_list.append(seq_tokens_list[i])
-                seq_sess_masks_list.append(seq_masks_list[i])
-                sess_attn_masks_list.append(None)
-                sess_Ks_list.append(None)
-
-        output, sess_outputs_list = self._run_multi_seq_blocks(
-            q_tokens_list, ns_tokens, seq_sess_tokens_list, seq_sess_masks_list,
-            apply_dropout=False,
-            sess_attn_masks_list=sess_attn_masks_list,
-            sess_Ks_list=sess_Ks_list,
+        output = self._run_multi_seq_blocks(
+            q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+            apply_dropout=False
         )
 
         logits = self.clsfier(output)
