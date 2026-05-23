@@ -44,16 +44,20 @@ def main():
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    EXPECTED = {'user_dense_feats_61': 256, 'user_dense_feats_87': 320}
     files = sorted(Path(args.data_dir).glob("*.parquet"))
     f61_list, f87_list = [], []
+    total_rows = 0
     for pf in files:
         t = pq.read_table(str(pf))
         for name, out in [('user_dense_feats_61', f61_list), ('user_dense_feats_87', f87_list)]:
             col = t.column(name).to_numpy()
             for arr in col:
-                if isinstance(arr, np.ndarray) and arr.ndim == 1 and len(arr) > 0:
+                total_rows += 1
+                if isinstance(arr, np.ndarray) and arr.ndim == 1 and len(arr) == EXPECTED[name]:
                     out.append(arr.astype(np.float32))
     f61, f87 = np.stack(f61_list), np.stack(f87_list)
+    logging.info(f"f61: {len(f61_list)}/{total_rows} valid, f87: {len(f87_list)}/{total_rows} valid")
     logging.info(f"f61: {f61.shape}, f87: {f87.shape}")
 
     np.save(os.path.join(args.output_dir, 'f61_centroids.npy'), _kmeans(f61, args.K))

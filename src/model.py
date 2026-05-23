@@ -2912,6 +2912,9 @@ class PCVRHyFormer(nn.Module):
         f87 = user_dense[:, self._f87_offset:self._f87_offset + self._f87_dim].to(self._f87_centroids.dtype)
         c61 = torch.cdist(f61, self._f61_centroids, p=2).argmin(dim=-1) + 1
         c87 = torch.cdist(f87, self._f87_centroids, p=2).argmin(dim=-1) + 1
+        # Zero vectors → padding (id=0)
+        c61[(f61.abs().sum(dim=1) == 0)] = 0
+        c87[(f87.abs().sum(dim=1) == 0)] = 0
         return torch.stack([c61, c87], dim=1)
 
     def _embed_seq_domain(
