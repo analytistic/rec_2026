@@ -280,12 +280,11 @@ def main() -> None:
     # ---- K-means centroids for f61/f87 cluster int features ----
     centroids_dir = cfg.get('centroids_dir', None)
     if centroids_dir and os.path.exists(centroids_dir):
-        import numpy as np
-        f61_path = os.path.join(centroids_dir, 'f61_centroids.npy')
-        f87_path = os.path.join(centroids_dir, 'f87_centroids.npy')
+        f61_path = os.path.join(centroids_dir, 'f61_centroids.pt')
+        f87_path = os.path.join(centroids_dir, 'f87_centroids.pt')
         if os.path.exists(f61_path) and os.path.exists(f87_path):
-            model_args['f61_centroids'] = torch.from_numpy(np.load(f61_path))
-            model_args['f87_centroids'] = torch.from_numpy(np.load(f87_path))
+            model_args['f61_centroids'] = torch.load(f61_path)
+            model_args['f87_centroids'] = torch.load(f87_path)
             logging.info(f"Loaded centroids from {centroids_dir}")
 
     model = PCVRHyFormer(**model_args).to(cfg['device'])
