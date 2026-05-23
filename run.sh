@@ -14,12 +14,12 @@ python3 -m zipfile -e "${SCRIPT_DIR}/src.zip" "${SCRIPT_DIR}"
 # Uncomment to run preprocessing. Comment out after first run to skip.
 # python3 -u -m src.preprocess_split_by_timestamp --valid_ratio 0.1
 
-# ---- Step 2 (optional): Pre-compute K-means centroids for f61/f87 ----
-# Uncomment on first run, then comment out to skip.
-# python3 -u -m src.kmeans_precompute \
-#     --data_dir "${TRAIN_DATA_PATH}" \
-#     --K 128 \
-#     --output_dir "${USER_CACHE_PATH}/centroids" \
+# ---- Step 2: Pre-compute K-means centroids for f61/f87 ----
+# Comment out after first run to skip.
+python3 -u -m src.kmeans_precompute \
+    --data_dir "${TRAIN_DATA_PATH}" \
+    --K 128 \
+    --output_dir "${USER_CACHE_PATH}/centroids" \
 
 # ---- Step 3: Train ----
 CENTROIDS_DIR="${USER_CACHE_PATH}/centroids"
