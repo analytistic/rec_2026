@@ -2942,29 +2942,31 @@ class PCVRHyFormer(nn.Module):
             (self.user_ns_tokenizer, self.user_ns_tokenizer.feature_specs),
             (self.item_ns_tokenizer, self.item_ns_tokenizer.feature_specs),
         ]:
-            for i, (vs, offset, length) in enumerate(specs):
-                real_idx = tokenizer._emb_index[i]
-                if real_idx == -1:
-                    if i in tokenizer._hash_multi and int(vs) > cardinality_threshold:
-                        cfg = tokenizer._hash_multi[i]
-                        start, k = cfg['start'], cfg['k']
-                        for j in range(k):
-                            emb = tokenizer.hash_embs[start + j]
-                            nn.init.xavier_normal_(emb.weight.data)
-                            emb.weight.data[0, :] = 0
-                            reinit_ptrs.add(emb.weight.data_ptr())
-                            reinit_count += 1
+            subs = tokenizer.experts if isinstance(tokenizer, MoERankMixerNSTokenizer) else [tokenizer]
+            for sub in subs:
+                for i, (vs, offset, length) in enumerate(specs):
+                    real_idx = sub._emb_index[i]
+                    if real_idx == -1:
+                        if i in sub._hash_multi and int(vs) > cardinality_threshold:
+                            cfg = sub._hash_multi[i]
+                            start, k = cfg['start'], cfg['k']
+                            for j in range(k):
+                                emb = sub.hash_embs[start + j]
+                                nn.init.xavier_normal_(emb.weight.data)
+                                emb.weight.data[0, :] = 0
+                                reinit_ptrs.add(emb.weight.data_ptr())
+                                reinit_count += 1
+                        else:
+                            skip_count += 1
+                        continue
+                    emb = sub.embs[real_idx]
+                    if int(vs) > cardinality_threshold:
+                        nn.init.xavier_normal_(emb.weight.data)
+                        emb.weight.data[0, :] = 0
+                        reinit_ptrs.add(emb.weight.data_ptr())
+                        reinit_count += 1
                     else:
                         skip_count += 1
-                    continue
-                emb = tokenizer.embs[real_idx]
-                if int(vs) > cardinality_threshold:
-                    nn.init.xavier_normal_(emb.weight.data)
-                    emb.weight.data[0, :] = 0
-                    reinit_ptrs.add(emb.weight.data_ptr())
-                    reinit_count += 1
-                else:
-                    skip_count += 1
 
         # time_embedding is always preserved
         if self.num_time_buckets > 0:
