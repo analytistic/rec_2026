@@ -2758,9 +2758,9 @@ class PCVRHyFormer(nn.Module):
         else:
             self.rotary_emb = None
 
-        # Output projection
+        # Output projection (Q + ns_pool)
         self.output_proj = nn.Sequential(
-            nn.Linear(num_queries * self.num_sequences * d_model, d_model),
+            nn.Linear((num_queries * self.num_sequences + 1) * d_model, d_model),
             MixedNorm(d_model, norm_type),
         )
 
@@ -3070,11 +3070,12 @@ class PCVRHyFormer(nn.Module):
                 rope_sin_list=rope_sin_list,
             )
 
-        # Output: concatenate all sequences' Q tokens then project via MLP
+        # Output: concatenate Q tokens + ns_pool, then project via MLP
         B = curr_qs[0].shape[0]
         all_q = torch.cat(curr_qs, dim=1)  # (B, Nq*S, D)
-        output = all_q.view(B, -1)  # (B, Nq*S*D)
-        output = self.output_proj(output)  # (B, D)
+        ns_pool = curr_ns.mean(dim=1)      # (B, D)
+        flat = torch.cat([all_q.view(B, -1), ns_pool], dim=-1)  # (B, (Nq*S+1)*D)
+        output = self.output_proj(flat)    # (B, D)
 
         return output
 
