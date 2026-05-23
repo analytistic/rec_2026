@@ -85,7 +85,7 @@ Item int 特征的 train/test 分布存在严重偏移：
 | 12  | 78.7%        | 73.9%       | 同 f7，高度相关                     |
 | 16  | 91.8%        | 88.4%       | 最稀疏，train/test top-5 完全无重叠 |
 
-这些特征原始值域很大，但经过 mod 编码压缩到 21 个取值，碰撞严重，标准 Embedding(21, emb_dim) 无法区分碰撞到同一桶的不同 ID。Seq 侧也存在 vocab 极大的特征（seq_c/f47: 86.3M、f29: 5.8M），直接建 Embedding 不现实。
+这些特征原始值域很大（f16 达 35,259），标准 Embedding(vocab, emb_dim) 中大量 id 在 train 中未出现，test 出现时 OOV。Seq 侧也存在 vocab 极大的特征（seq_c/f47: 86.3M、f29: 5.8M），直接建 Embedding 不现实。
 
 ### 方案
 
@@ -100,7 +100,7 @@ hash_idx_j = 0 if val == 0   # padding
 
 ### 选定特征
 
-**Item NS**（mod 21 碰撞最严重）：f16/512/4
+**Item NS**（vocab 最大，train/test top-5 完全无重叠）：f16/512/4
 **Seq**（vocab 过大，会被 emb_skip_threshold=1M 跳过）：seq_b/f69/512/4(64.7M), seq_c/f29/512/4(5.8M), f34/512/4(1.0M), f47/512/4(86.3M)
 
 ### 效果
