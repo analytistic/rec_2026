@@ -30,8 +30,8 @@ sparse_dtype: float32
 use_amp: true
 
 # ─── Model ───────────────────────────────────────────────────────────────────
-d_model: 64
-emb_dim: 64
+d_model: 72
+emb_dim: 72
 num_queries: 4
 num_hyformer_blocks: 2
 num_heads: 4
