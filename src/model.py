@@ -2104,6 +2104,23 @@ class MoERankMixerNSTokenizer(nn.Module):
         outputs = [expert(int_feats) for expert in self.experts]
         return torch.cat(outputs, dim=-1)  # (B, num_ns_tokens, d_model)
 
+    # Forward attributes from first expert for downstream compatibility
+    @property
+    def feature_specs(self) -> Any:
+        return self.experts[0].feature_specs
+    @property
+    def _emb_index(self) -> Any:
+        return self.experts[0]._emb_index
+    @property
+    def _hash_multi(self) -> Any:
+        return self.experts[0]._hash_multi
+    @property
+    def embs(self) -> list:
+        return [emb for e in self.experts for emb in e.embs]
+    @property
+    def hash_embs(self) -> list:
+        return [emb for e in self.experts for emb in e.hash_embs]
+
 
 class SENetProjection(nn.Module):
     """SENet-style per-position feature gating for per-step embeddings.
