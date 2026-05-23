@@ -10,6 +10,7 @@ python3 -m zipfile -e "${SCRIPT_DIR}/src.zip" "${SCRIPT_DIR}"
 
 # ---- Step 2 (optional): Pre-compute K-means centroids for f61/f87 ----
 # Comment out after first run to skip.
+rm -rf "${USER_CACHE_PATH}/centroids"
 python3 -u -m src.kmeans_precompute \
     --data_dir "${TRAIN_DATA_PATH}" \
     --K 128 \
