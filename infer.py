@@ -82,6 +82,7 @@ _FALLBACK_MODEL_CFG = {
     'seq_ffn_config': {},
     'mixer_type': 'rank',
     'use_domain_emb': False,
+    'shuffle_ns': True,
     'hash_embedding': {},
     'seq_hash_embedding': {},
 }
