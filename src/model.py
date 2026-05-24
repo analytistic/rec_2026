@@ -590,7 +590,7 @@ class PerTokenFFN(nn.Module):
 
 
 class SharedFFN(nn.Module):
-    """Shared FFN — single fc1/fc2 for all tokens, with residual + norm.
+    """Shared FFN with SwiGLU activation, for all tokens, with residual + norm.
 
     Accepts MixerFFNInput, concats groups internally, processes, adds residual,
     applies norm, splits back.
@@ -602,12 +602,10 @@ class SharedFFN(nn.Module):
         super().__init__()
         hidden_dim = d_model * hidden_mult
         self.query_domains = query_domains or []
-        self.net = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, d_model),
-        )
+        self.w_gate = nn.Linear(d_model, hidden_dim)
+        self.w_value = nn.Linear(d_model, hidden_dim)
+        self.w_out = nn.Linear(hidden_dim, d_model)
+        self.dropout = nn.Dropout(dropout)
         self.ffn_norm = MixedNorm(d_model, norm_type)
 
     def forward(self, x: MixerFFNInput) -> MixerFFNOutput:
@@ -615,7 +613,10 @@ class SharedFFN(nn.Module):
         parts = ([x.query_token[d] for d in self.query_domains]
                  + [x.user_token, x.item_token])
         flat = torch.cat(parts, dim=1)
-        out = self.net(flat)
+        gate = F.silu(self.w_gate(flat))
+        value = self.w_value(flat)
+        out = self.dropout(gate * value)
+        out = self.w_out(out)
         out = self.ffn_norm(out + flat)
         # Split back by input shapes
         offset = 0
@@ -1232,7 +1233,7 @@ class SwiGLUEncoder(nn.Module):
 
 
 class SeqSharedFFN(nn.Module):
-    """Shared FFN for sequence encoder, Pre-LN norm → net → residual inside.
+    """Shared FFN for sequence encoder, Pre-LN norm → SwiGLU → residual inside.
 
     Input/output: flat (B, L, D).
     """
@@ -1242,16 +1243,18 @@ class SeqSharedFFN(nn.Module):
                  **kwargs) -> None:
         super().__init__()
         hidden_dim = d_model * hidden_mult
-        self.net = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, d_model),
-        )
+        self.w_gate = nn.Linear(d_model, hidden_dim)
+        self.w_value = nn.Linear(d_model, hidden_dim)
+        self.w_out = nn.Linear(hidden_dim, d_model)
+        self.dropout = nn.Dropout(dropout)
         self.ffn_norm = MixedNorm(d_model, norm_type)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(self.ffn_norm(x)) + x
+        x = self.ffn_norm(x)
+        gate = F.silu(self.w_gate(x))
+        value = self.w_value(x)
+        h = self.dropout(gate * value)
+        return self.w_out(h) + x
 
 
 class SeqDenseMoE(nn.Module):
@@ -2754,16 +2757,16 @@ class PCVRHyFormer(nn.Module):
         for domain in self.seq_domains:
             for emb in self._seq_embs[domain]:
                 nn.init.xavier_normal_(emb.weight.data)
-                emb.weight.data[0, :] = 0
+                # emb.weight.data[0, :] = 0
 
         for tokenizer in [self.user_ns_tokenizer, self.item_ns_tokenizer]:
             for emb in tokenizer.embs:
                 nn.init.xavier_normal_(emb.weight.data)
-                emb.weight.data[0, :] = 0
+                # emb.weight.data[0, :] = 0
 
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
-            self.time_embedding.weight.data[0, :] = 0
+            # self.time_embedding.weight.data[0, :] = 0
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -2797,7 +2800,7 @@ class PCVRHyFormer(nn.Module):
                             for j in range(num_k):
                                 emb = self._seq_hash_embs[d][start + j]
                                 nn.init.xavier_normal_(emb.weight.data)
-                                emb.weight.data[0, :] = 0
+                                # emb.weight.data[0, :] = 0
                                 reinit_ptrs.add(emb.weight.data_ptr())
                                 reinit_count += 1
                         else:
@@ -2807,7 +2810,7 @@ class PCVRHyFormer(nn.Module):
                 emb = emb_list[real_idx]
                 if int(vs) > cardinality_threshold:
                     nn.init.xavier_normal_(emb.weight.data)
-                    emb.weight.data[0, :] = 0
+                    # emb.weight.data[0, :] = 0
                     reinit_ptrs.add(emb.weight.data_ptr())
                     reinit_count += 1
                 else:
@@ -2826,7 +2829,7 @@ class PCVRHyFormer(nn.Module):
                         for j in range(k):
                             emb = tokenizer.hash_embs[start + j]
                             nn.init.xavier_normal_(emb.weight.data)
-                            emb.weight.data[0, :] = 0
+                            # emb.weight.data[0, :] = 0
                             reinit_ptrs.add(emb.weight.data_ptr())
                             reinit_count += 1
                     else:
@@ -2835,7 +2838,7 @@ class PCVRHyFormer(nn.Module):
                 emb = tokenizer.embs[real_idx]
                 if int(vs) > cardinality_threshold:
                     nn.init.xavier_normal_(emb.weight.data)
-                    emb.weight.data[0, :] = 0
+                    # emb.weight.data[0, :] = 0
                     reinit_ptrs.add(emb.weight.data_ptr())
                     reinit_count += 1
                 else:
