@@ -152,7 +152,6 @@ def main() -> None:
         seq_max_lens=seq_max_lens,
         valid_data_dir=cfg.get('valid_data_dir'),
         add_seq_time_attrs=cfg.get('add_seq_time_attrs', True),
-        seq_mask_ratio=cfg.get('seq_mask_ratio', 0.0),
     )
 
     # ---- NS groups ----

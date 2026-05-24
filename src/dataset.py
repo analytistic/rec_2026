@@ -165,10 +165,9 @@ class PCVRParquetDataset(IterableDataset):
         is_training: bool = True,
         ts_max: Optional[int] = None,
         add_seq_time_attrs: bool = True,
-        seq_mask_ratio: float = 0.0,
     ) -> None:
-        self.seq_mask_ratio = seq_mask_ratio
         """
+        Args:
             parquet_path: either a directory containing ``*.parquet`` files or
                 a single parquet file path.
             schema_path: path of the schema JSON describing feature layouts.
@@ -731,11 +730,6 @@ class PCVRParquetDataset(IterableDataset):
                 else:
                     slice_c[:] = 0
 
-            # Random event-level masking (training only)
-            if self.is_training and self.seq_mask_ratio > 0:
-                mask = np.random.rand(B, max_len) < self.seq_mask_ratio
-                out[:, :, mask] = 0
-
             # Compute ts_padded before result copy so virtual time attrs
             # can be filled into the buffer before it is snapshotted.
             ts_padded = np.zeros((B, max_len), dtype=np.int64)
@@ -813,7 +807,6 @@ def get_pcvr_data(
     seq_max_lens: Optional[Dict[str, int]] = None,
     valid_data_dir: Optional[str] = None,
     add_seq_time_attrs: bool = True,
-    seq_mask_ratio: float = 0.0,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -868,7 +861,6 @@ def get_pcvr_data(
             clip_vocab=clip_vocab,
             ts_max=ts_max,
             add_seq_time_attrs=add_seq_time_attrs,
-            seq_mask_ratio=seq_mask_ratio,
         )
         train_loader = DataLoader(
             train_dataset, batch_size=None,
@@ -885,7 +877,6 @@ def get_pcvr_data(
             row_group_range=None,
             clip_vocab=clip_vocab,
             add_seq_time_attrs=add_seq_time_attrs,
-            seq_mask_ratio=seq_mask_ratio,
         )
         valid_loader = DataLoader(
             valid_dataset, batch_size=None,
@@ -937,7 +928,6 @@ def get_pcvr_data(
             row_group_range=(0, n_train_rgs),
             clip_vocab=clip_vocab,
             add_seq_time_attrs=add_seq_time_attrs,
-            seq_mask_ratio=seq_mask_ratio,
         )
         train_loader = DataLoader(
             train_dataset, batch_size=None,
@@ -954,7 +944,6 @@ def get_pcvr_data(
             row_group_range=(total_rgs - n_valid_rgs, total_rgs),
             clip_vocab=clip_vocab,
             add_seq_time_attrs=add_seq_time_attrs,
-            seq_mask_ratio=seq_mask_ratio,
         )
         valid_loader = DataLoader(
             valid_dataset, batch_size=None,
