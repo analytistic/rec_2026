@@ -2378,6 +2378,9 @@ class PCVRHyFormer(nn.Module):
         use_domain_emb: bool = False,
         # Seq multi-hash embedding config: {domain: {pos: {H, k}}}
         seq_hash_config: Optional[Dict[str, Any]] = None,
+        # K-means centroids for f61/f87 → cluster int features
+        f61_centroids: Optional[torch.Tensor] = None,
+        f87_centroids: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
 
@@ -2418,6 +2421,21 @@ class PCVRHyFormer(nn.Module):
                 torch.tensor([0, 7,7, 0,0,0,0, 1,1,1,1, 2,2, 3,3, 4,4, 5,5,5, 6,6,6, 7,7],
                              dtype=torch.long))
             self.time_code_emb = nn.Embedding(16, d_model)
+
+        # ---- Cluster int features for f61/f87 ----
+        self.has_cluster = f61_centroids is not None and f87_centroids is not None
+        if self.has_cluster:
+            self.register_buffer('_f61_centroids', f61_centroids.contiguous().float(), persistent=True)
+            self.register_buffer('_f87_centroids', f87_centroids.contiguous().float(), persistent=True)
+            # user_dense layout: f61(256), f62(6), f63(19), f64(26), f65(111),
+            #                     f66(150), f87(320), f89(10), f90(10), f91(10)
+            self._f61_offset, self._f61_dim = 0, 256
+            self._f87_offset, self._f87_dim = 568, 320
+            # Augment user_int specs so tokenizer handles them
+            user_int_feature_specs.append((110, self._f61_centroids.shape[0], 1))
+            user_int_feature_specs.append((111, self._f87_centroids.shape[0], 1))
+            user_ns_groups.append([len(user_ns_groups)])
+            user_ns_groups.append([len(user_ns_groups)])
 
         if ns_tokenizer_type == 'group':
             # Original: one NS token per group
@@ -2888,6 +2906,17 @@ class PCVRHyFormer(nn.Module):
         sparse_ptrs = {p.data_ptr() for p in self.get_sparse_params()}
         return [p for p in self.parameters() if p.data_ptr() not in sparse_ptrs]
 
+    def _cluster_ids(self, user_dense: torch.Tensor) -> torch.Tensor:
+        """Compute (B, 2) cluster IDs for f61/f87, 1-based (0=padding)."""
+        f61 = user_dense[:, self._f61_offset:self._f61_offset + self._f61_dim].to(self._f61_centroids.dtype)
+        f87 = user_dense[:, self._f87_offset:self._f87_offset + self._f87_dim].to(self._f87_centroids.dtype)
+        c61 = torch.cdist(f61, self._f61_centroids, p=2).argmin(dim=-1) + 1
+        c87 = torch.cdist(f87, self._f87_centroids, p=2).argmin(dim=-1) + 1
+        # Zero vectors → padding (id=0)
+        c61[(f61.abs().sum(dim=1) == 0)] = 0
+        c87[(f87.abs().sum(dim=1) == 0)] = 0
+        return torch.stack([c61, c87], dim=1)
+
     def _embed_seq_domain(
         self,
         seq: torch.Tensor,
@@ -3031,6 +3060,9 @@ class PCVRHyFormer(nn.Module):
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
         user_int_feats = inputs.user_int_feats
+        if self.has_cluster:
+            cluster_ids = self._cluster_ids(inputs.user_dense_feats)
+            user_int_feats = torch.cat([user_int_feats, cluster_ids], dim=1)
 
         user_ns = self.user_ns_tokenizer(user_int_feats).to(self.dense_dtype)   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats).to(self.dense_dtype)   # (B, num_item_groups, D)
@@ -3112,6 +3144,9 @@ class PCVRHyFormer(nn.Module):
     def predict(self, inputs: ModelInput) -> ModelOutput:
         """Runs inference without dropout, returning logits, embeddings and ns_tokens."""
         user_int_feats = inputs.user_int_feats
+        if self.has_cluster:
+            cluster_ids = self._cluster_ids(inputs.user_dense_feats)
+            user_int_feats = torch.cat([user_int_feats, cluster_ids], dim=1)
 
         user_ns = self.user_ns_tokenizer(user_int_feats).to(self.dense_dtype)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats).to(self.dense_dtype)
