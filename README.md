@@ -156,3 +156,18 @@ $$
 |hidden_dim (默认)|$4d$|$4d$（保持）|
 
 SwiGLU 中的 $W_{\text{gate}}$ 和 $W_{\text{value}}$ 并行计算，gate 通过 SiLU 激活后与 value 相乘，等价于为每个 token 学习一个逐维度的门控权重，控制哪些信息进入后续层。LLaMA、PaLM 等主流模型已全面采用 SwiGLU。
+
+### SiLU vs Sigmoid
+
+$$
+\text{Sigmoid}(x) = \frac{1}{1 + e^{-x}}, \quad \text{SiLU}(x) = x \cdot \sigma(x)
+$$
+
+| x | sigmoid | SiLU | 含义 |
+|---|---------|------|------|
+| -10 | ≈ 0 | ≈ 0 | 都关闭 |
+| -2 | 0.12 | -0.24 | sigmoid 正，SiLU 负（相位不同） |
+| 0 | 0.50 | 0 | sigmoid 有信号，SiLU 无信号 |
+| 5 | ≈ 1 | ≈ 5 | sigmoid 饱和丢失幅度，SiLU 保留幅度 |
+
+sigmoid 作为 gate 时，所有正输入被压缩到 (0.5, 1)，丢失了"这个信号有多强"的信息。SiLU 保留了输入幅度，gate 值越大通过的信息越多，作为门控函数更优。
