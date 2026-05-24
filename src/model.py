@@ -590,7 +590,7 @@ class PerTokenFFN(nn.Module):
 
 
 class SharedFFN(nn.Module):
-    """Shared FFN with SwiGLU activation, for all tokens, with residual + norm.
+    """Shared FFN — single fc1/fc2 for all tokens, with residual + norm.
 
     Accepts MixerFFNInput, concats groups internally, processes, adds residual,
     applies norm, splits back.
@@ -602,10 +602,12 @@ class SharedFFN(nn.Module):
         super().__init__()
         hidden_dim = d_model * hidden_mult
         self.query_domains = query_domains or []
-        self.w_gate = nn.Linear(d_model, hidden_dim)
-        self.w_value = nn.Linear(d_model, hidden_dim)
-        self.w_out = nn.Linear(hidden_dim, d_model)
-        self.dropout = nn.Dropout(dropout)
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+        )
         self.ffn_norm = MixedNorm(d_model, norm_type)
 
     def forward(self, x: MixerFFNInput) -> MixerFFNOutput:
@@ -613,10 +615,7 @@ class SharedFFN(nn.Module):
         parts = ([x.query_token[d] for d in self.query_domains]
                  + [x.user_token, x.item_token])
         flat = torch.cat(parts, dim=1)
-        gate = F.silu(self.w_gate(flat))
-        value = self.w_value(flat)
-        out = self.dropout(gate * value)
-        out = self.w_out(out)
+        out = self.net(flat)
         out = self.ffn_norm(out + flat)
         # Split back by input shapes
         offset = 0
@@ -1233,7 +1232,7 @@ class SwiGLUEncoder(nn.Module):
 
 
 class SeqSharedFFN(nn.Module):
-    """Shared FFN for sequence encoder, Pre-LN norm → SwiGLU → residual inside.
+    """Shared FFN for sequence encoder, Pre-LN norm → net → residual inside.
 
     Input/output: flat (B, L, D).
     """
@@ -1243,18 +1242,16 @@ class SeqSharedFFN(nn.Module):
                  **kwargs) -> None:
         super().__init__()
         hidden_dim = d_model * hidden_mult
-        self.w_gate = nn.Linear(d_model, hidden_dim)
-        self.w_value = nn.Linear(d_model, hidden_dim)
-        self.w_out = nn.Linear(hidden_dim, d_model)
-        self.dropout = nn.Dropout(dropout)
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+        )
         self.ffn_norm = MixedNorm(d_model, norm_type)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.ffn_norm(x)
-        gate = F.silu(self.w_gate(x))
-        value = self.w_value(x)
-        h = self.dropout(gate * value)
-        return self.w_out(h) + x
+        return self.net(self.ffn_norm(x)) + x
 
 
 class SeqDenseMoE(nn.Module):
