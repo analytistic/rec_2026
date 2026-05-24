@@ -67,7 +67,6 @@ fourier_seq: false
 fourier_ns: false
 use_row_time_ns: true
 add_seq_time_attrs: true
-seq_mask_ratio: 0.0
 use_domain_emb: true
 
 hash_embedding:
