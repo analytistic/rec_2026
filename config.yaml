@@ -30,8 +30,8 @@ sparse_dtype: float32
 use_amp: true
 
 # ─── Model ───────────────────────────────────────────────────────────────────
-d_model: 72
-emb_dim: 72
+d_model: 64
+emb_dim: 64
 num_queries: 4
 num_hyformer_blocks: 2
 num_heads: 4
@@ -55,9 +55,8 @@ rope_base: 10000.0
 emb_skip_threshold: 1000000
 seq_id_threshold: 100
 ns_tokenizer_type: rankmixer
-user_ns_tokens: 8
-item_ns_tokens: 3
-shuffle_ns: true
+user_ns_tokens: 9
+item_ns_tokens: 4
 ns_groups_json: ""
 rank_mixer_mode: full
 

@@ -268,7 +268,6 @@ def main() -> None:
         "fourier_ns": cfg['fourier_ns'],
         "use_row_time_ns": cfg['use_row_time_ns'],
         "use_domain_emb": cfg.get('use_domain_emb', False),
-        "shuffle_ns": cfg.get('shuffle_ns', True),
         "seq_proj_type": cfg['seq_proj_type'],
         "seq_ffn_name": cfg['seq_ffn_name'],
         "seq_ffn_config": cfg['seq_ffn_config'],

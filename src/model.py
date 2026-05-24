@@ -1823,13 +1823,6 @@ class GroupNSTokenizer(nn.Module):
             for group in groups
         ])
 
-        # Global token: mean pool all raw embeddings → MLP
-        self.global_mlp = nn.Sequential(
-            nn.Linear(emb_dim, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, d_model),
-        )
-
     def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
         """Embeds and projects grouped discrete features into NS tokens.
 
@@ -1839,40 +1832,31 @@ class GroupNSTokenizer(nn.Module):
         Returns:
             Tokens of shape (B, num_groups, D).
         """
-        # Embed all fids across all groups, collect for global pool
-        group_cats = []
-        all_fid_embs = []
-        for group in self.groups:
+        tokens = []
+        for group, proj in zip(self.groups, self.group_projs):
             fid_embs = []
             for fid_idx in group:
                 vs, offset, length = self.feature_specs[fid_idx]
                 emb_real_idx = self._emb_index[fid_idx]
                 if emb_real_idx == -1:
+                    # Filtered high-cardinality feature: output zero vector
                     fid_emb = int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
                 else:
                     emb_layer = self.embs[emb_real_idx]
                     if length == 1:
-                        fid_emb = emb_layer(int_feats[:, offset].long())
+                        # Single-value feature: direct lookup
+                        fid_emb = emb_layer(int_feats[:, offset].long())  # (B, emb_dim)
                     else:
-                        vals = int_feats[:, offset:offset + length].long()
-                        emb_all = emb_layer(vals)
-                        mask = (vals != 0).to(emb_all.dtype).unsqueeze(-1)
-                        count = mask.sum(dim=1).clamp(min=1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count
+                        # Multi-value feature: lookup then mean pooling (ignoring padding=0)
+                        vals = int_feats[:, offset:offset + length].long()  # (B, length)
+                        emb_all = emb_layer(vals)  # (B, length, emb_dim)
+                        mask = (vals != 0).to(emb_all.dtype).unsqueeze(-1)  # (B, length, 1)
+                        count = mask.sum(dim=1).clamp(min=1)  # (B, 1)
+                        fid_emb = (emb_all * mask).sum(dim=1) / count  # (B, emb_dim)
                 fid_embs.append(fid_emb)
-                all_fid_embs.append(fid_emb)
-            group_cats.append(torch.cat(fid_embs, dim=-1))  # (B, len(group)*emb_dim)
-
-        # Project all groups
-        tokens = []
-        for cat_emb, proj in zip(group_cats, self.group_projs):
-            tokens.append(F.silu(proj(cat_emb.to(proj[0].weight.dtype))).unsqueeze(1))
-
-        # Append global token
-        global_emb = torch.stack(all_fid_embs, dim=0).mean(dim=0)
-        global_token = self.global_mlp(global_emb).unsqueeze(1)
-        tokens.append(global_token)
-        return torch.cat(tokens, dim=1)
+            cat_emb = torch.cat(fid_embs, dim=-1)  # (B, num_fids*emb_dim)
+            tokens.append(F.silu(proj(cat_emb.to(proj[0].weight.dtype))).unsqueeze(1))  # (B, 1, D)
+        return torch.cat(tokens, dim=1)  # (B, num_groups, D)
 
 
 class RankMixerNSTokenizer(nn.Module):
@@ -1893,7 +1877,6 @@ class RankMixerNSTokenizer(nn.Module):
         emb_skip_threshold: int = 0,
         norm_type: str = 'layer',
         hash_config: Optional[Dict[int, Any]] = None,
-        shuffle: bool = False,
     ) -> None:
         """Initializes RankMixerNSTokenizer.
 
@@ -1913,7 +1896,6 @@ class RankMixerNSTokenizer(nn.Module):
         self.emb_dim = emb_dim
         self.num_ns_tokens = num_ns_tokens
         self.emb_skip_threshold = emb_skip_threshold
-        self.shuffle = shuffle
         self.hash_config = hash_config or {}
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
@@ -1974,13 +1956,6 @@ class RankMixerNSTokenizer(nn.Module):
             f"num_ns_tokens={num_ns_tokens}, pad={self._pad_size}"
         )
 
-        # Global token: mean pool all raw embeddings → MLP
-        self.global_mlp = nn.Sequential(
-            nn.Linear(emb_dim, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, d_model),
-        )
-
     def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
         """Embeds all features, concatenates, splits, and projects.
 
@@ -2029,11 +2004,6 @@ class RankMixerNSTokenizer(nn.Module):
                         )
                 all_embs.append(fid_emb)
 
-        # Shuffle fid order before concat during training (batch-level permutation)
-        if self.shuffle and self.training:
-            idx = torch.randperm(len(all_embs), device=all_embs[0].device)
-            all_embs = [all_embs[i] for i in idx]
-
         cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
 
         # 2. Pad if needed
@@ -2045,11 +2015,6 @@ class RankMixerNSTokenizer(nn.Module):
         tokens = []
         for chunk, proj in zip(chunks, self.token_projs):
             tokens.append(F.silu(proj(chunk.to(proj[0].weight.dtype))).unsqueeze(1))  # (B, 1, d_model)
-
-        # Global token: mean pool all raw embeddings → MLP
-        global_emb = torch.stack(all_embs, dim=0).mean(dim=0)  # (B, emb_dim)
-        global_token = self.global_mlp(global_emb).unsqueeze(1)  # (B, 1, d_model)
-        tokens.append(global_token)
 
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
@@ -2200,13 +2165,6 @@ class AutoNSTokenizer(nn.Module):
             f"{num_groups} groups, k={self.k}"
         )
 
-        # Global token: mean pool all raw embeddings → MLP
-        self.global_mlp = nn.Sequential(
-            nn.Linear(emb_dim, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, d_model),
-        )
-
     def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
         """Embed → top-k group → concat → project."""
         B = int_feats.shape[0]
@@ -2230,27 +2188,26 @@ class AutoNSTokenizer(nn.Module):
                 all_embs.append(f)
         X = torch.stack(all_embs, dim=1)  # (B, n_f, emb_dim)
 
-        # Top-k grouping: produce num_groups-1 groups, then append global token
+        # Top-k grouping: each group selects its k features
+   
         topk_weights = F.softmax(self.W, dim=-1)  # (n_g, n_f)
         topk_scores, topk_idx = torch.topk(topk_weights, self.k, dim=-1)  # (n_g, k)
 
-        # Gather k features per group (all groups computed, drop the last)
+        # Gather k features per group
         idx = topk_idx.unsqueeze(0).unsqueeze(-1).expand(B, -1, -1, self.emb_dim)
         X_exp = X.unsqueeze(1).expand(-1, self.num_groups, -1, -1)
         grouped = torch.gather(X_exp, 2, idx)  # (B, n_g, k, emb_dim)
 
         # Scale + concat → project → SiLU
-        topk_scores = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-8)
-        w = topk_scores.unsqueeze(0).unsqueeze(-1)
-        out = (grouped * w).reshape(B, self.num_groups, -1)
+        topk_scores = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-8)  # Normalize scores
+        w = topk_scores.unsqueeze(0).unsqueeze(-1)  # (1, n_g, k, 1)
+        out = (grouped * w).reshape(B, self.num_groups, -1)  # (B, n_g, k*emb_dim)
         tokens = []
         for i in range(self.num_groups):
-            tokens.append(F.silu(self.token_projs[i](out[:, i, :].to(self.token_projs[i][0].weight.dtype))).unsqueeze(1))
+            tokens.append(F.silu(self.token_projs[i](out[:, i, :].to(self.token_projs[i][0].weight.dtype))).unsqueeze(1))  # (B, 1, d_model)
 
-        # Append global token
-        global_token = self.global_mlp(X.mean(dim=1)).unsqueeze(1)
-        tokens.append(global_token)
-        return torch.cat(tokens, dim=1)  # (B, n_g+1, d_model)
+
+        return torch.cat(tokens, dim=1)  # (B, n_g, d_model)
 
 
 class PairedProcessor(nn.Module):
@@ -2400,8 +2357,6 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
-        # Shuffle fid order before concat during training
-        shuffle_ns: bool = True,
         # Dtype control
         dense_dtype: torch.dtype = torch.float32,
         sparse_dtype: torch.dtype = torch.float32,
@@ -2501,7 +2456,6 @@ class PCVRHyFormer(nn.Module):
                 emb_skip_threshold=emb_skip_threshold,
                 norm_type=norm_type,
                 hash_config=user_hash_config,
-                shuffle=shuffle_ns,
             )
             num_user_ns = user_ns_tokens
 
@@ -2514,7 +2468,6 @@ class PCVRHyFormer(nn.Module):
                 emb_skip_threshold=emb_skip_threshold,
                 norm_type=norm_type,
                 hash_config=item_hash_config,
-                shuffle=shuffle_ns,
             )
             num_item_ns = item_ns_tokens
         elif ns_tokenizer_type == 'auto':
@@ -2581,10 +2534,6 @@ class PCVRHyFormer(nn.Module):
             )
         num_paired = len(paired_feature_specs)
         num_paired_tokens = 1 if self.has_paired else 0
-
-        # Global token for user and item (one extra token each)
-        num_user_ns += 1
-        num_item_ns += 1
 
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0) + num_paired_tokens
@@ -3083,8 +3032,8 @@ class PCVRHyFormer(nn.Module):
         # 1. NS tokens: grouped projection
         user_int_feats = inputs.user_int_feats
 
-        user_ns = self.user_ns_tokenizer(user_int_feats).to(self.dense_dtype)
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats).to(self.dense_dtype)
+        user_ns = self.user_ns_tokenizer(user_int_feats).to(self.dense_dtype)   # (B, num_user_groups, D)
+        item_ns = self.item_ns_tokenizer(inputs.item_int_feats).to(self.dense_dtype)   # (B, num_item_groups, D)
 
         if self.use_domain_emb:
             user_ns = user_ns + self.user_domain_emb

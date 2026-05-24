@@ -118,7 +118,6 @@ User 侧 f62-66（int+float 配对）和 f89-91（定长 10 的配对特征）�
 `PairedProcessor`：每个 paired fid 独立处理，多槽位 int 值经 Embedding 后以 log1p(float_val) 为权重做加权求和，输出一个 emb_dim 向量，最后 concat 所有 fid 的向量投影为一个 d_model token。
 
 两类 float 不同处理：
-
 - **Count 型**（f62-66 的 count/sum/duration）：weight = log1p(float) / log1p(global_max[int])，用该 int 值在全局中的最大 float 归一化
 - **Score 型**（f89-91 的匹配度得分）：weight = float，原始得分直接作为权重
 
@@ -127,18 +126,3 @@ User 侧 f62-66（int+float 配对）和 f89-91（定长 10 的配对特征）�
 ### 效果
 
 同时配合 padding 修正，test AUC 0.822→0.824（paired processor 单独收益无法量化）。
-
-## Effective Rank
-
-Effective Rank 衡量隐藏表示矩阵 $\mathbf{H} \in \mathbb{R}^{N \times d}$ 的有效维度数，用于分析模型是否发生了表示坍缩（collapse）。
-
-设 $\sigma_1, \ldots, \sigma_k$ 为 $\mathbf{H}$ 的奇异值（$k = \min(N, d)$），归一化奇异值分布为 $p_i = \sigma_i / \sum_{j=1}^k \sigma_j$，则：
-
-$$
-\text{erank}(\mathbf{H}) = \exp\left(-\sum_{i=1}^k p_i \ln p_i\right)
-$$
-
-即归一化奇异值分布的 Shannon 熵的指数。
-
-- **erank ≈ 1**：表示坍缩到单个主成分，$d$ 维 embedding 只用了 1 维有效信息
-- **erank ≈ k**：信息均匀分布在各正交维度，全部维度被充分利用
