@@ -166,8 +166,10 @@ class PCVRParquetDataset(IterableDataset):
         ts_max: Optional[int] = None,
         add_seq_time_attrs: bool = True,
         seq_mask_ratio: float = 0.0,
+        ns_mask_ratio: float = 0.0,
     ) -> None:
         self.seq_mask_ratio = seq_mask_ratio
+        self.ns_mask_ratio = ns_mask_ratio
         """
             parquet_path: either a directory containing ``*.parquet`` files or
                 a single parquet file path.
@@ -616,6 +618,9 @@ class PCVRParquetDataset(IterableDataset):
                 else:
                     padded[:] = 0
                 user_int[:, offset:offset + dim] = padded
+        if self.is_training and self.ns_mask_ratio > 0:
+            mask = np.random.rand(*user_int.shape) < self.ns_mask_ratio
+            user_int[mask] = 0
 
         # ---- item_int ----
         item_int = self._buf_item_int[:B]
@@ -637,6 +642,9 @@ class PCVRParquetDataset(IterableDataset):
                 else:
                     padded[:] = 0
                 item_int[:, offset:offset + dim] = padded
+        if self.is_training and self.ns_mask_ratio > 0:
+            mask = np.random.rand(*item_int.shape) < self.ns_mask_ratio
+            item_int[mask] = 0
 
         # ---- user_dense (non-paired only: f61, f87) ----
         user_dense = self._buf_user_dense[:B]
@@ -813,6 +821,7 @@ def get_pcvr_data(
     valid_data_dir: Optional[str] = None,
     add_seq_time_attrs: bool = True,
     seq_mask_ratio: float = 0.0,
+    ns_mask_ratio: float = 0.0,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -868,6 +877,7 @@ def get_pcvr_data(
             ts_max=ts_max,
             add_seq_time_attrs=add_seq_time_attrs,
             seq_mask_ratio=seq_mask_ratio,
+            ns_mask_ratio=ns_mask_ratio,
         )
         train_loader = DataLoader(
             train_dataset, batch_size=None,
@@ -885,6 +895,7 @@ def get_pcvr_data(
             clip_vocab=clip_vocab,
             add_seq_time_attrs=add_seq_time_attrs,
             seq_mask_ratio=seq_mask_ratio,
+            ns_mask_ratio=ns_mask_ratio,
         )
         valid_loader = DataLoader(
             valid_dataset, batch_size=None,
@@ -937,6 +948,7 @@ def get_pcvr_data(
             clip_vocab=clip_vocab,
             add_seq_time_attrs=add_seq_time_attrs,
             seq_mask_ratio=seq_mask_ratio,
+            ns_mask_ratio=ns_mask_ratio,
         )
         train_loader = DataLoader(
             train_dataset, batch_size=None,
@@ -954,6 +966,7 @@ def get_pcvr_data(
             clip_vocab=clip_vocab,
             add_seq_time_attrs=add_seq_time_attrs,
             seq_mask_ratio=seq_mask_ratio,
+            ns_mask_ratio=ns_mask_ratio,
         )
         valid_loader = DataLoader(
             valid_dataset, batch_size=None,
