@@ -86,6 +86,8 @@ fourier_seq: false
 fourier_ns: false
 use_row_time_ns: true
 add_seq_time_attrs: true
+# Training augmentation: random event masking
+seq_mask_ratio: 0.0
 
 # ─── Domain Embedding ─────────────────────────────────────────────────────────
 use_domain_emb: true
