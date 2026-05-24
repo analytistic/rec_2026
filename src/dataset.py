@@ -731,6 +731,11 @@ class PCVRParquetDataset(IterableDataset):
                 else:
                     slice_c[:] = 0
 
+            # Random event-level masking (training only)
+            if self.is_training and self.seq_mask_ratio > 0:
+                mask = np.random.rand(B, max_len) < self.seq_mask_ratio
+                out[:, :, mask] = 0
+
             # Compute ts_padded before result copy so virtual time attrs
             # can be filled into the buffer before it is snapshotted.
             ts_padded = np.zeros((B, max_len), dtype=np.int64)
@@ -762,10 +767,6 @@ class PCVRParquetDataset(IterableDataset):
                         # weekend: workday=1, weekend=2
                         out[:, n_real + 2, :][valid_events] = (dow_raw >= 5).astype(np.int64) + 1
 
-            # Random event-level masking (training only)
-            if self.is_training and self.seq_mask_ratio > 0:
-                mask = np.random.rand(B, 1, max_len) < self.seq_mask_ratio
-                out[mask] = 0
             result[domain] = torch.from_numpy(out.copy())
             result[f'{domain}_len'] = torch.from_numpy(lengths.copy())
 
