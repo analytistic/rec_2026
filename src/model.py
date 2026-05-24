@@ -2754,16 +2754,16 @@ class PCVRHyFormer(nn.Module):
         for domain in self.seq_domains:
             for emb in self._seq_embs[domain]:
                 nn.init.xavier_normal_(emb.weight.data)
-                emb.weight.data[0, :] = 0
+                # emb.weight.data[0, :] = 0
 
         for tokenizer in [self.user_ns_tokenizer, self.item_ns_tokenizer]:
             for emb in tokenizer.embs:
                 nn.init.xavier_normal_(emb.weight.data)
-                emb.weight.data[0, :] = 0
+                # emb.weight.data[0, :] = 0
 
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
-            self.time_embedding.weight.data[0, :] = 0
+            # self.time_embedding.weight.data[0, :] = 0
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -2797,7 +2797,7 @@ class PCVRHyFormer(nn.Module):
                             for j in range(num_k):
                                 emb = self._seq_hash_embs[d][start + j]
                                 nn.init.xavier_normal_(emb.weight.data)
-                                emb.weight.data[0, :] = 0
+                                # emb.weight.data[0, :] = 0
                                 reinit_ptrs.add(emb.weight.data_ptr())
                                 reinit_count += 1
                         else:
@@ -2807,7 +2807,7 @@ class PCVRHyFormer(nn.Module):
                 emb = emb_list[real_idx]
                 if int(vs) > cardinality_threshold:
                     nn.init.xavier_normal_(emb.weight.data)
-                    emb.weight.data[0, :] = 0
+                    # emb.weight.data[0, :] = 0
                     reinit_ptrs.add(emb.weight.data_ptr())
                     reinit_count += 1
                 else:
@@ -2826,7 +2826,7 @@ class PCVRHyFormer(nn.Module):
                         for j in range(k):
                             emb = tokenizer.hash_embs[start + j]
                             nn.init.xavier_normal_(emb.weight.data)
-                            emb.weight.data[0, :] = 0
+                            # emb.weight.data[0, :] = 0
                             reinit_ptrs.add(emb.weight.data_ptr())
                             reinit_count += 1
                     else:
@@ -2835,7 +2835,7 @@ class PCVRHyFormer(nn.Module):
                 emb = tokenizer.embs[real_idx]
                 if int(vs) > cardinality_threshold:
                     nn.init.xavier_normal_(emb.weight.data)
-                    emb.weight.data[0, :] = 0
+                    # emb.weight.data[0, :] = 0
                     reinit_ptrs.add(emb.weight.data_ptr())
                     reinit_count += 1
                 else:
