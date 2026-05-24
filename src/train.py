@@ -74,8 +74,6 @@ def parse_args_and_config() -> Dict[str, Any]:
                         help='Training device, e.g. cuda or cpu')
     parser.add_argument('--num_workers', type=int, default=None,
                         help='Number of DataLoader workers')
-    parser.add_argument('--centroids_dir', type=str, default=None,
-                        help='K-means centroids for f61/f87 cluster features')
 
     cli_args = parser.parse_args()
 
@@ -276,16 +274,6 @@ def main() -> None:
     }
 
     logging.info(f"Dtype config: dense={cfg['dense_dtype']}, sparse={cfg['sparse_dtype']}")
-
-    # ---- K-means centroids for f61/f87 cluster int features ----
-    centroids_dir = cfg.get('centroids_dir', None)
-    if centroids_dir and os.path.exists(centroids_dir):
-        f61_path = os.path.join(centroids_dir, 'f61_centroids.pt')
-        f87_path = os.path.join(centroids_dir, 'f87_centroids.pt')
-        if os.path.exists(f61_path) and os.path.exists(f87_path):
-            model_args['f61_centroids'] = torch.load(f61_path)
-            model_args['f87_centroids'] = torch.load(f87_path)
-            logging.info(f"Loaded centroids from {centroids_dir}")
 
     model = PCVRHyFormer(**model_args).to(cfg['device'])
 
