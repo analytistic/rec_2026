@@ -2504,8 +2504,9 @@ class PCVRHyFormer(nn.Module):
         # User dense feature projection (if available)
         self.has_user_dense = user_dense_dim > 0
         if self.has_user_dense:
+            extra_ud = 30 if len(paired_feature_specs) > 0 else 0
             self.user_dense_proj = nn.Sequential(
-                nn.Linear(user_dense_dim, d_model),
+                nn.Linear(user_dense_dim + extra_ud, d_model),
                 MixedNorm(d_model, norm_type),
             )
 
@@ -3044,7 +3045,12 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats.to(self.dense_dtype))).unsqueeze(1)  # (B, 1, D)
+            user_dense = inputs.user_dense_feats.to(self.dense_dtype)
+            # Concat f89-91 float from paired_float (offsets 312,322,332, dim=10 each)
+            if self.has_paired:
+                f89_91 = inputs.paired_float_feats[:, 312:342].to(self.dense_dtype)
+                user_dense = torch.cat([user_dense, f89_91], dim=1)
+            user_dense_tok = F.silu(self.user_dense_proj(user_dense)).unsqueeze(1)  # (B, 1, D)
             if self.use_domain_emb:
                 user_dense_tok = user_dense_tok + self.user_domain_emb
             ns_parts.append(user_dense_tok)
